@@ -31,6 +31,8 @@ OPENAI_API_KEY="..." ./target/release/codehelm plan "explain this architecture"
 
 The Rust CLI supports live `plan`, `review`, `exec`, and transactional `build` runs through OpenAI and Anthropic. Build mode snapshots original file contents, writes atomically, and can roll back every edit from the current run.
 
+Rust build mode can also run configured allowlisted commands directly, without invoking a shell. Commands are bounded by configured timeout and output limits; OS-level filesystem and network isolation remains on the roadmap.
+
 ## Features
 
 - OpenAI, Anthropic, Ollama, and OpenAI-compatible providers
@@ -135,7 +137,7 @@ node ./bin/codehelm.js --help
 
 ## Roadmap
 
-- Sandboxed command execution with explicit approvals
+- OS-level command sandboxing and explicit interactive approvals
 - Patch-based edits with visual diff approval
 - Git worktree checkpoints and rollback
 - MCP client and plugin/skill system

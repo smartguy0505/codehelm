@@ -156,7 +156,9 @@ async fn run_agent(
     )?;
     let writable = mode == "build";
     if writable {
-        tools = tools.enable_edits();
+        tools = tools
+            .enable_edits()
+            .enable_commands(config.command_timeout_ms);
     }
     let approvals: Box<dyn ApprovalHandler> = if writable {
         Box::new(BuildApproval)

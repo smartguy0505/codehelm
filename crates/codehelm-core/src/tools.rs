@@ -21,6 +21,7 @@ pub struct WorkspaceTools {
     max_output_chars: usize,
     writable: bool,
     snapshots: HashMap<PathBuf, Option<Vec<u8>>>,
+    command_timeout_ms: Option<u64>,
 }
 
 impl WorkspaceTools {
@@ -36,11 +37,17 @@ impl WorkspaceTools {
             max_output_chars,
             writable: false,
             snapshots: HashMap::new(),
+            command_timeout_ms: None,
         })
     }
 
     pub fn enable_edits(mut self) -> Self {
         self.writable = true;
+        self
+    }
+
+    pub fn enable_commands(mut self, timeout_ms: u64) -> Self {
+        self.command_timeout_ms = Some(timeout_ms);
         self
     }
 
@@ -284,6 +291,44 @@ impl WorkspaceTools {
         Ok(format!("Rolled back {count} file(s)"))
     }
 
+    async fn run_command(&self, args: &Value) -> Result<String, AgentError> {
+        let command = required_arg(args, "command")?;
+        if self.policy.command_decision(command) != Decision::Allow {
+            return Err(tool_error(
+                "run_command",
+                "command is not explicitly allowlisted",
+            ));
+        }
+        let parts = shell_words::split(command)
+            .map_err(|error| tool_error("run_command", format!("invalid command: {error}")))?;
+        let (program, arguments) = parts
+            .split_first()
+            .ok_or_else(|| tool_error("run_command", "command is empty"))?;
+        let timeout_ms = self
+            .command_timeout_ms
+            .ok_or_else(|| tool_error("run_command", "command execution is disabled"))?;
+        let child = tokio::process::Command::new(program)
+            .args(arguments)
+            .current_dir(&self.root)
+            .env("CODEHELM_AGENT", "1")
+            .kill_on_drop(true)
+            .output();
+        let output = tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), child)
+            .await
+            .map_err(|_| tool_error("run_command", format!("timed out after {timeout_ms}ms")))?
+            .map_err(|error| tool_error("run_command", error))?;
+        let combined = format!(
+            "exit code: {}\n{}{}",
+            output
+                .status
+                .code()
+                .map_or_else(|| "signal".into(), |code| code.to_string()),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(self.truncate(combined.trim_end().to_owned()))
+    }
+
     fn truncate(&self, value: String) -> String {
         if value.chars().count() <= self.max_output_chars {
             return value;
@@ -329,6 +374,9 @@ impl ToolExecutor for WorkspaceTools {
                 spec("rollback_edits", "Rollback all files changed during this run", json!({"type":"object","properties":{},"additionalProperties":false})),
             ]);
         }
+        if self.command_timeout_ms.is_some() {
+            specs.push(spec("run_command", "Run one explicitly allowlisted command without a shell", json!({"type":"object","properties":{"command":{"type":"string"}},"required":["command"],"additionalProperties":false})));
+        }
         specs
     }
 
@@ -340,6 +388,7 @@ impl ToolExecutor for WorkspaceTools {
             "write_file" => self.write_file(args),
             "replace_in_file" => self.replace_in_file(args),
             "rollback_edits" if self.writable => self.rollback(),
+            "run_command" => self.run_command(args).await,
             _ => Err(tool_error(tool, "unknown or unavailable tool")),
         }
     }
@@ -367,6 +416,7 @@ impl ApprovalHandler for BuildApproval {
                 | "write_file"
                 | "replace_in_file"
                 | "rollback_edits"
+                | "run_command"
         )
     }
 }
@@ -495,6 +545,33 @@ mod tests {
                 .contains("needle")
         );
         assert!(!root.join("new.txt").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn commands_are_shell_free_and_policy_gated() {
+        let root = workspace();
+        let mut policy = PermissionPolicy::default();
+        policy.allow_commands.push("rustc --version".into());
+        let mut tools = WorkspaceTools::new(&root, policy, 1_000)
+            .unwrap()
+            .enable_commands(5_000);
+        let result = tools
+            .execute("run_command", &json!({"command":"rustc --version"}))
+            .await
+            .unwrap();
+        assert!(result.starts_with("exit code: 0\nrustc "));
+        assert!(
+            tools
+                .execute(
+                    "run_command",
+                    &json!({"command":"rustc --version && echo unsafe"})
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("allowlisted")
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }
