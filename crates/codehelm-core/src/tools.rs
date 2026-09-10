@@ -215,6 +215,112 @@ impl WorkspaceTools {
         }))
     }
 
+    fn git_status(&self) -> Result<String, AgentError> {
+        let raw = self.run_git_bytes(["status", "--porcelain=v1", "-z", "--branch"])?;
+        let records = raw
+            .split(|byte| *byte == 0)
+            .filter(|record| !record.is_empty())
+            .collect::<Vec<_>>();
+        let mut lines = Vec::new();
+        let mut index = 0;
+        while index < records.len() {
+            let record = records[index];
+            if record.starts_with(b"## ") {
+                lines.push(String::from_utf8_lossy(record).into_owned());
+                index += 1;
+                continue;
+            }
+            if record.len() < 4 {
+                index += 1;
+                continue;
+            }
+            let status = &record[..2];
+            let path = &record[3..];
+            if self.git_path_visible(path)? {
+                lines.push(format!(
+                    "{} {}",
+                    String::from_utf8_lossy(status),
+                    String::from_utf8_lossy(path)
+                ));
+            }
+            index += 1;
+            if status.contains(&b'R') || status.contains(&b'C') {
+                index += 1;
+            }
+        }
+        Ok(self.truncate(if lines.is_empty() {
+            "(no changes)".into()
+        } else {
+            lines.join("\n")
+        }))
+    }
+
+    fn git_diff(&self, args: &Value) -> Result<String, AgentError> {
+        let staged = args["staged"].as_bool().unwrap_or(false);
+        let requested = string_arg(args, "path");
+        let mut names = vec!["diff", "--name-only", "-z"];
+        if staged {
+            names.push("--cached");
+        }
+        names.push("--");
+        if let Some(path) = requested {
+            self.relative(path)?;
+            names.push(path);
+        }
+        let changed = self.run_git_bytes(names)?;
+        let mut output = String::new();
+        for path in changed
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+        {
+            let path = String::from_utf8_lossy(path);
+            if !self.git_path_visible(path.as_bytes())? {
+                continue;
+            }
+            let mut diff = vec!["diff", "--no-ext-diff", "--unified=3"];
+            if staged {
+                diff.push("--cached");
+            }
+            diff.extend(["--", path.as_ref()]);
+            output.push_str(&String::from_utf8_lossy(&self.run_git_bytes(diff)?));
+        }
+        Ok(self.truncate(if output.is_empty() {
+            "(no changes)".into()
+        } else {
+            output.trim_end().to_owned()
+        }))
+    }
+
+    fn git_path_visible(&self, path: &[u8]) -> Result<bool, AgentError> {
+        let relative = PathBuf::from(String::from_utf8_lossy(path).as_ref());
+        Ok(self
+            .policy
+            .read_decision(&relative)
+            .map_err(|error| tool_error("permission", error))?
+            != Decision::Deny
+            && resolve_inside(&self.root, &relative).is_ok())
+    }
+
+    fn run_git_bytes<I, S>(&self, args: I) -> Result<Vec<u8>, AgentError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&self.root)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .output()
+            .map_err(|error| tool_error("git", error))?;
+        if !output.status.success() {
+            return Err(tool_error(
+                "git",
+                String::from_utf8_lossy(&output.stderr).trim(),
+            ));
+        }
+        Ok(output.stdout)
+    }
+
     fn write_path(&mut self, requested: &str, content: &[u8]) -> Result<String, AgentError> {
         if !self.writable {
             return Err(tool_error("write_file", "editing is disabled"));
@@ -409,6 +515,20 @@ impl ToolExecutor for WorkspaceTools {
                     "type":"object", "properties":{"pattern":{"type":"string"},"path":{"type":"string"}}, "required":["pattern"], "additionalProperties":false
                 }),
             ),
+            spec(
+                "git_status",
+                "Show the current Git branch and concise working-tree status",
+                json!({"type":"object","properties":{},"additionalProperties":false}),
+            ),
+            spec(
+                "git_diff",
+                "Show an unstaged or staged Git diff, optionally limited to one path",
+                json!({
+                    "type":"object",
+                    "properties":{"staged":{"type":"boolean"},"path":{"type":"string"}},
+                    "additionalProperties":false
+                }),
+            ),
         ];
         if self.writable {
             specs.extend([
@@ -432,6 +552,8 @@ impl ToolExecutor for WorkspaceTools {
             "list_files" => self.list_files(args),
             "read_file" => self.read_file(args),
             "search" => self.search(args),
+            "git_status" => self.git_status(),
+            "git_diff" => self.git_diff(args),
             "write_file" => self.write_file(args),
             "replace_in_file" => self.replace_in_file(args),
             "rollback_edits" if self.writable => self.rollback(),
@@ -446,7 +568,10 @@ pub struct ReadOnlyApproval;
 #[async_trait(?Send)]
 impl ApprovalHandler for ReadOnlyApproval {
     async fn approve(&mut self, tool: &str, _args: &Value, _reason: Option<&str>) -> bool {
-        matches!(tool, "list_files" | "read_file" | "search")
+        matches!(
+            tool,
+            "list_files" | "read_file" | "search" | "git_status" | "git_diff"
+        )
     }
 }
 
@@ -467,7 +592,8 @@ impl<F> PolicyApproval<F> {
 
     fn decision(&self, tool: &str, args: &Value) -> Decision {
         match tool {
-            "list_files" | "read_file" | "search" | "rollback_edits" => Decision::Allow,
+            "list_files" | "read_file" | "search" | "git_status" | "git_diff"
+            | "rollback_edits" => Decision::Allow,
             "write_file" | "replace_in_file" => {
                 args["path"].as_str().map_or(Decision::Deny, |path| {
                     self.policy
@@ -619,6 +745,17 @@ mod tests {
         path
     }
 
+    fn git(root: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", root)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+
     #[tokio::test]
     async fn reads_lines_and_hides_sensitive_files() {
         let root = workspace();
@@ -742,6 +879,33 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("denied by policy")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn readonly_git_tools_filter_sensitive_paths() {
+        let root = workspace();
+        git(&root, &["init", "--quiet"]);
+        git(&root, &["config", "user.email", "test@codehelm.local"]);
+        git(&root, &["config", "user.name", "CodeHelm Test"]);
+        git(&root, &["add", "src/lib.rs", ".env"]);
+        git(&root, &["commit", "--quiet", "-m", "initial"]);
+        fs::write(root.join("src/lib.rs"), "visible change\n").unwrap();
+        fs::write(root.join(".env"), "SECRET=changed\n").unwrap();
+
+        let mut tools = WorkspaceTools::new(&root, PermissionPolicy::default(), 10_000).unwrap();
+        let status = tools.execute("git_status", &json!({})).await.unwrap();
+        assert!(status.contains("src/lib.rs"));
+        assert!(!status.contains(".env"));
+        let diff = tools.execute("git_diff", &json!({})).await.unwrap();
+        assert!(diff.contains("visible change"));
+        assert!(!diff.contains("SECRET"));
+        assert!(
+            tools
+                .execute("git_diff", &json!({"path":"../outside"}))
+                .await
+                .is_err()
         );
         fs::remove_dir_all(root).unwrap();
     }

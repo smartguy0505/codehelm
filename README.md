@@ -20,6 +20,7 @@ The Rust workspace currently provides:
 - Structured tool-call identity preserved across provider turns
 - Multiple tool calls per model turn with deterministic authorization and execution
 - Workspace-contained Rust tools for listing, reading, and regex search
+- Fixed-argument read-only Git status and diff tools in every operating mode
 
 Build and inspect the Rust CLI:
 
