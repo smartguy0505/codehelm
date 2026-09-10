@@ -9,8 +9,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use codehelm_core::{
     Agent, AnthropicProvider, ApprovalHandler, Config, McpManager, ModelProvider, OllamaProvider,
     OpenAiProvider, PolicyApproval, Provider, RetryPolicy, SessionRecorder, SessionStore,
-    WorkspaceTools, config::ConfigOverrides, discover_workspace, list_checkpoints, load_config,
-    load_project_instructions, restore_checkpoint,
+    SkillRegistry, WorkspaceTools, config::ConfigOverrides, discover_workspace, list_checkpoints,
+    load_config, load_project_instructions, restore_checkpoint,
 };
 use codehelm_protocol::AgentEvent;
 use tracing_subscriber::EnvFilter;
@@ -281,6 +281,7 @@ async fn run_agent_with_session(
         config.permissions.clone(),
         config.max_tool_output_chars,
     )?;
+    tools = tools.with_skills(SkillRegistry::discover(root, config.max_skill_chars)?);
     if !config.mcp_servers.is_empty() {
         tools = tools.with_mcp(McpManager::connect(&config.mcp_servers, root).await?);
     }
@@ -298,7 +299,7 @@ async fn run_agent_with_session(
     let instructions = load_project_instructions(root, cwd, config.max_instruction_chars)?;
     let working_directory = cwd.strip_prefix(root).unwrap_or(cwd).display();
     let system = format!(
-        "You are CodeHelm, a careful coding agent. Mode: {mode}. Workspace paths are relative to the project root. Invocation directory: {working_directory}. Inspect before editing, make focused changes, and verify your work. The rollback_edits tool can restore every file changed during this run. Never invent tool results.\n\nProject instructions:\n{instructions}"
+        "You are CodeHelm, a careful coding agent. Mode: {mode}. Workspace paths are relative to the project root. Invocation directory: {working_directory}. Inspect before editing, make focused changes, and verify your work. Load relevant skill instructions on demand with list_skills and read_skill when those tools are available. The rollback_edits tool can restore every file changed during this run. Never invent tool results.\n\nProject instructions:\n{instructions}"
     );
     let resumed = saved.is_some();
     let store = match saved {

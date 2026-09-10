@@ -15,6 +15,7 @@ use crate::{
     checkpoint::Checkpoint,
     mcp::McpManager,
     permissions::{Decision, PermissionPolicy, resolve_inside},
+    skills::SkillRegistry,
 };
 
 pub struct WorkspaceTools {
@@ -25,6 +26,7 @@ pub struct WorkspaceTools {
     checkpoint: Option<Checkpoint>,
     command_timeout_ms: Option<u64>,
     mcp: Option<McpManager>,
+    skills: SkillRegistry,
 }
 
 impl WorkspaceTools {
@@ -42,6 +44,7 @@ impl WorkspaceTools {
             checkpoint: None,
             command_timeout_ms: None,
             mcp: None,
+            skills: SkillRegistry::default(),
         })
     }
 
@@ -59,6 +62,23 @@ impl WorkspaceTools {
     pub fn with_mcp(mut self, mcp: McpManager) -> Self {
         self.mcp = Some(mcp);
         self
+    }
+
+    pub fn with_skills(mut self, skills: SkillRegistry) -> Self {
+        self.skills = skills;
+        self
+    }
+
+    fn list_skills(&self) -> String {
+        self.skills.list()
+    }
+
+    fn read_skill(&self, args: &Value) -> Result<String, AgentError> {
+        let name = required_arg(args, "name")?;
+        self.skills
+            .read(name)
+            .map(str::to_owned)
+            .ok_or_else(|| tool_error("read_skill", format!("unknown skill: {name}")))
     }
 
     fn relative(&self, requested: &str) -> Result<(PathBuf, PathBuf), AgentError> {
@@ -634,6 +654,20 @@ impl ToolExecutor for WorkspaceTools {
         if let Some(mcp) = &self.mcp {
             specs.extend_from_slice(mcp.specs());
         }
+        if !self.skills.is_empty() {
+            specs.extend([
+                spec(
+                    "list_skills",
+                    "List available on-demand skill packages and their descriptions",
+                    json!({"type":"object","properties":{},"additionalProperties":false}),
+                ),
+                spec(
+                    "read_skill",
+                    "Load the complete instructions for one available skill",
+                    json!({"type":"object","properties":{"name":{"type":"string"}},"required":["name"],"additionalProperties":false}),
+                ),
+            ]);
+        }
         specs
     }
 
@@ -656,6 +690,8 @@ impl ToolExecutor for WorkspaceTools {
             "search" => self.search(args),
             "git_status" => self.git_status(),
             "git_diff" => self.git_diff(args),
+            "list_skills" if !self.skills.is_empty() => Ok(self.list_skills()),
+            "read_skill" if !self.skills.is_empty() => self.read_skill(args),
             "write_file" => self.write_file(args),
             "replace_in_file" => self.replace_in_file(args),
             "rollback_edits" if self.writable => self.rollback(),
@@ -672,7 +708,13 @@ impl ApprovalHandler for ReadOnlyApproval {
     async fn approve(&mut self, tool: &str, _args: &Value, _reason: Option<&str>) -> bool {
         matches!(
             tool,
-            "list_files" | "read_file" | "search" | "git_status" | "git_diff"
+            "list_files"
+                | "read_file"
+                | "search"
+                | "git_status"
+                | "git_diff"
+                | "list_skills"
+                | "read_skill"
         )
     }
 }
@@ -694,8 +736,8 @@ impl<F> PolicyApproval<F> {
 
     fn decision(&self, tool: &str, args: &Value) -> Decision {
         match tool {
-            "list_files" | "read_file" | "search" | "git_status" | "git_diff"
-            | "rollback_edits" => Decision::Allow,
+            "list_files" | "read_file" | "search" | "git_status" | "git_diff" | "list_skills"
+            | "read_skill" | "rollback_edits" => Decision::Allow,
             "write_file" | "replace_in_file" => {
                 args["path"].as_str().map_or(Decision::Deny, |path| {
                     self.policy

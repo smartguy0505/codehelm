@@ -22,6 +22,7 @@ The Rust workspace currently provides:
 - Workspace-contained Rust tools for listing, reading, and regex search
 - Fixed-argument read-only Git status and diff tools in every operating mode
 - MCP stdio servers with lifecycle negotiation, paginated discovery, and namespaced tools
+- On-demand project skills from validated `.agents/skills` and `.codehelm/skills` packages
 
 Build and inspect the Rust CLI:
 
@@ -103,6 +104,8 @@ Configure MCP stdio servers under `mcpServers`. CodeHelm negotiates the stable `
 
 Use `permissions.allowMcpTools` and `permissions.denyMcpTools` glob patterns for unattended MCP policy. Denials take precedence and cannot be bypassed by `--yes`; unmatched MCP tools require approval.
 
+Project skill packages live at `.agents/skills/<package>/SKILL.md` or `.codehelm/skills/<package>/SKILL.md`. Each file uses YAML frontmatter with `name` and `description`. CodeHelm exposes compact metadata first and loads complete instructions only when the agent selects a relevant skill, keeping routine context small.
+
 ## Commands
 
 ```text
@@ -132,6 +135,7 @@ Merged configuration is validated before execution. Invalid URLs, permission glo
   "model": "gpt-5-mini",
   "maxTurns": 20,
   "maxInstructionChars": 100000,
+  "maxSkillChars": 200000,
   "maxContextChars": 400000,
   "providerMaxRetries": 3,
   "providerRetryBaseMs": 500,
@@ -191,7 +195,7 @@ node ./bin/codehelm.js --help
 - OS-level command sandboxing and explicit interactive approvals
 - Patch-based edits with visual diff approval
 - Git worktree checkpoints and rollback
-- Plugin and skill system
+- Plugin manifests and distribution
 - ACP server for editor integration
 - Parallel subagents with isolated worktrees
 - Tree-sitter/LSP context ranking

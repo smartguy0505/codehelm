@@ -47,6 +47,7 @@ pub struct Config {
     pub command_timeout_ms: u64,
     pub max_tool_output_chars: usize,
     pub max_instruction_chars: usize,
+    pub max_skill_chars: usize,
     pub max_context_chars: usize,
     pub provider_max_retries: usize,
     pub provider_retry_base_ms: u64,
@@ -66,6 +67,7 @@ impl Default for Config {
             command_timeout_ms: 120_000,
             max_tool_output_chars: 30_000,
             max_instruction_chars: 100_000,
+            max_skill_chars: 200_000,
             max_context_chars: 400_000,
             provider_max_retries: 3,
             provider_retry_base_ms: 500,
@@ -168,6 +170,7 @@ impl Config {
             1,
             10_000_000,
         )?;
+        validate_range("maxSkillChars", self.max_skill_chars as u64, 1, 10_000_000)?;
         validate_range(
             "maxContextChars",
             self.max_context_chars as u64,
