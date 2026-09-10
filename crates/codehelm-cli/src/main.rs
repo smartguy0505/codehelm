@@ -8,8 +8,8 @@ use std::{
 use clap::{Parser, Subcommand, ValueEnum};
 use codehelm_core::{
     Agent, AnthropicProvider, ApprovalHandler, BuildApproval, Config, ModelProvider,
-    OpenAiProvider, Provider, ReadOnlyApproval, SessionRecorder, SessionStore, WorkspaceTools,
-    config::ConfigOverrides, list_checkpoints, load_config, restore_checkpoint,
+    OllamaProvider, OpenAiProvider, Provider, ReadOnlyApproval, SessionRecorder, SessionStore,
+    WorkspaceTools, config::ConfigOverrides, list_checkpoints, load_config, restore_checkpoint,
 };
 use codehelm_protocol::AgentEvent;
 use tracing_subscriber::EnvFilter;
@@ -200,7 +200,18 @@ async fn run_agent_with_session(
             };
             Box::new(provider)
         }
-        Provider::Ollama => return Err("the native Ollama adapter is not implemented yet".into()),
+        Provider::Ollama => {
+            let base_url = config
+                .base_url
+                .clone()
+                .or_else(|| env::var("OLLAMA_HOST").ok());
+            let provider = if let Some(base_url) = base_url {
+                OllamaProvider::with_base_url(&config.model, base_url)
+            } else {
+                OllamaProvider::new(&config.model)
+            };
+            Box::new(provider)
+        }
     };
     let mut tools = WorkspaceTools::new(
         cwd,

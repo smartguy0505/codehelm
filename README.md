@@ -29,7 +29,7 @@ cargo build --release
 OPENAI_API_KEY="..." ./target/release/codehelm plan "explain this architecture"
 ```
 
-The Rust CLI supports live `plan`, `review`, `exec`, and transactional `build` runs through OpenAI and Anthropic. Build mode snapshots original file contents, writes atomically, and can roll back every edit from the current run.
+The Rust CLI supports live `plan`, `review`, `exec`, and transactional `build` runs through OpenAI, Anthropic, and local Ollama models. Build mode snapshots original file contents, writes atomically, and can roll back every edit from the current run.
 
 Rust build mode can also run configured allowlisted commands directly, without invoking a shell. Commands are bounded by configured timeout and output limits; OS-level filesystem and network isolation remains on the roadmap.
 
@@ -73,7 +73,7 @@ codehelm build --provider anthropic --model claude-sonnet-4-6 "fix the failing t
 For a local Ollama model:
 
 ```bash
-codehelm build --provider ollama --model qwen3-coder "explain and improve this project"
+cargo run --release -p codehelm-cli -- build --provider ollama --model qwen3-coder "explain and improve this project"
 ```
 
 For OpenAI-compatible gateways, set `provider` to `openai-compatible`, provide `baseUrl` in `.codehelm/config.json`, and set `CODEHELM_API_KEY`.
