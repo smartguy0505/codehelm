@@ -35,6 +35,8 @@ OPENAI_API_KEY="..." ./target/release/codehelm plan "explain this architecture"
 
 The Rust CLI supports live `plan`, `review`, `exec`, and transactional `build` runs through OpenAI, Anthropic, and local Ollama models. Build mode snapshots original file contents, writes atomically, and can roll back every edit from the current run.
 
+Running `codehelm` or `codehelm chat` starts a durable multi-turn session. The same provider connection, MCP servers, tools, token budget, and context are reused until `/exit`, `/quit`, end-of-input, or interruption.
+
 Rust build mode can also run configured allowlisted commands directly, without invoking a shell. Commands are bounded by configured timeout and output limits; OS-level filesystem and network isolation remains on the roadmap.
 
 Command stdout and stderr are drained concurrently with bounded in-memory capture, preventing noisy subprocesses from exhausting agent memory or deadlocking on full pipes. Child processes receive a minimal allowlisted environment instead of inheriting API keys and unrelated credentials.

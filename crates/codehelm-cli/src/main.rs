@@ -173,6 +173,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 RunOptions {
                     json: cli.json,
                     assume_yes: cli.yes,
+                    interactive: false,
                 },
                 Some(store),
             )
@@ -185,7 +186,23 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             );
             run_agent(&root, &cwd, &config, &task, "review", cli.json, cli.yes).await?;
         }
-        command => print_migration_status(command, &config, cli.json),
+        Command::Chat => {
+            run_agent_with_session(
+                &root,
+                &cwd,
+                &config,
+                "",
+                "build",
+                RunOptions {
+                    json: cli.json,
+                    assume_yes: cli.yes,
+                    interactive: true,
+                },
+                None,
+            )
+            .await?;
+        }
+        Command::Init => unreachable!("init returns before configuration loading"),
     }
     Ok(())
 }
@@ -205,7 +222,11 @@ async fn run_agent(
         config,
         task,
         mode,
-        RunOptions { json, assume_yes },
+        RunOptions {
+            json,
+            assume_yes,
+            interactive: false,
+        },
         None,
     )
     .await
@@ -215,6 +236,7 @@ async fn run_agent(
 struct RunOptions {
     json: bool,
     assume_yes: bool,
+    interactive: bool,
 }
 
 async fn run_agent_with_session(
@@ -226,7 +248,11 @@ async fn run_agent_with_session(
     options: RunOptions,
     saved: Option<SessionStore>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let RunOptions { json, assume_yes } = options;
+    let RunOptions {
+        json,
+        assume_yes,
+        interactive,
+    } = options;
     let retry = RetryPolicy {
         max_retries: config.provider_max_retries,
         base_delay_ms: config.provider_retry_base_ms,
@@ -338,17 +364,85 @@ async fn run_agent_with_session(
         agent
     };
     let mut agent = agent.with_store(recorder);
-    tokio::select! {
-        result = agent.run(task) => { result?; }
-        signal = tokio::signal::ctrl_c() => {
-            signal?;
-            let event = AgentEvent::Cancelled { reason: "interrupt".into() };
-            cancel_recorder.append_event(&event)?;
-            render_event(event, json);
-            return Err(codehelm_core::AgentError::Cancelled.into());
+    if interactive {
+        if !json {
+            eprintln!("CodeHelm interactive session. Type /help for commands.");
+        }
+        loop {
+            if !json {
+                eprint!("codehelm> ");
+                io::stderr().flush()?;
+            }
+            let mut input = String::new();
+            match io::stdin().read_line(&mut input) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                    let event = AgentEvent::Cancelled {
+                        reason: "interrupt".into(),
+                    };
+                    cancel_recorder.append_event(&event)?;
+                    render_event(event, json);
+                    return Err(codehelm_core::AgentError::Cancelled.into());
+                }
+                Err(error) => return Err(error.into()),
+            }
+            match parse_chat_input(&input) {
+                ChatInput::Empty => continue,
+                ChatInput::Exit => break,
+                ChatInput::Help => {
+                    eprintln!("/help  show commands\n/exit  save and leave the session");
+                    continue;
+                }
+                ChatInput::Unknown(command) => {
+                    eprintln!("unknown chat command: {command}");
+                    continue;
+                }
+                ChatInput::Prompt(prompt) => tokio::select! {
+                    result = agent.run(prompt) => { result?; }
+                    signal = tokio::signal::ctrl_c() => {
+                        signal?;
+                        let event = AgentEvent::Cancelled { reason: "interrupt".into() };
+                        cancel_recorder.append_event(&event)?;
+                        render_event(event, json);
+                        return Err(codehelm_core::AgentError::Cancelled.into());
+                    }
+                },
+            }
+        }
+    } else {
+        tokio::select! {
+            result = agent.run(task) => { result?; }
+            signal = tokio::signal::ctrl_c() => {
+                signal?;
+                let event = AgentEvent::Cancelled { reason: "interrupt".into() };
+                cancel_recorder.append_event(&event)?;
+                render_event(event, json);
+                return Err(codehelm_core::AgentError::Cancelled.into());
+            }
         }
     }
     Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ChatInput<'a> {
+    Empty,
+    Exit,
+    Help,
+    Unknown(&'a str),
+    Prompt(&'a str),
+}
+
+fn parse_chat_input(input: &str) -> ChatInput<'_> {
+    let input = input.trim();
+    match input {
+        "" => ChatInput::Empty,
+        "/exit" | "/quit" => ChatInput::Exit,
+        "/help" => ChatInput::Help,
+        command if command.starts_with('/') => ChatInput::Unknown(command),
+        prompt => ChatInput::Prompt(prompt),
+    }
 }
 
 fn prompt_approval(description: &str, interactive: bool) -> bool {
@@ -443,40 +537,19 @@ fn write_new(path: PathBuf, content: &str) -> std::io::Result<()> {
     }
 }
 
-fn print_migration_status(command: Command, config: &Config, json: bool) {
-    let name = match command {
-        Command::Chat => "chat",
-        Command::Build { .. } => "build",
-        Command::Plan { .. } => "plan",
-        Command::Review { .. } => "review",
-        Command::Exec { .. } => "exec",
-        Command::Init
-        | Command::Config
-        | Command::Checkpoints
-        | Command::Rollback { .. }
-        | Command::Resume { .. } => {
-            unreachable!()
-        }
-    };
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "type": "migration_status",
-                "command": name,
-                "provider": config.provider,
-                "model": config.model,
-                "implemented": false,
-                "message": "Rust command surface is ready; the agent runtime is the next migration slice"
-            })
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_interactive_commands_without_stealing_normal_prompts() {
+        assert_eq!(parse_chat_input("  "), ChatInput::Empty);
+        assert_eq!(parse_chat_input("/quit\n"), ChatInput::Exit);
+        assert_eq!(parse_chat_input("/help"), ChatInput::Help);
+        assert_eq!(
+            parse_chat_input("explain /tmp handling"),
+            ChatInput::Prompt("explain /tmp handling")
         );
-    } else {
-        println!(
-            "Rust command '{name}' is configured for {}/{}.",
-            config.provider, config.model
-        );
-        println!(
-            "The Rust agent runtime is the next migration slice; use the JavaScript CLI for live agent runs meanwhile."
-        );
+        assert_eq!(parse_chat_input("/unknown"), ChatInput::Unknown("/unknown"));
     }
 }

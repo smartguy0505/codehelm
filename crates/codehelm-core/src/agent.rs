@@ -350,6 +350,7 @@ impl<E: EventSink> EventSink for UsageTrackingSink<'_, E> {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::{cell::RefCell, rc::Rc};
 
     use super::*;
 
@@ -536,5 +537,54 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, AgentEvent::ToolStart { .. }))
         );
+    }
+
+    struct RecordingProvider {
+        requests: Rc<RefCell<Vec<ModelRequest>>>,
+        responses: VecDeque<AgentAction>,
+    }
+
+    #[async_trait(?Send)]
+    impl ModelProvider for RecordingProvider {
+        async fn respond(
+            &mut self,
+            request: &ModelRequest,
+            _events: &mut dyn EventSink,
+        ) -> Result<AgentAction, AgentError> {
+            self.requests.borrow_mut().push(request.clone());
+            Ok(self.responses.pop_front().expect("mock response"))
+        }
+    }
+
+    #[tokio::test]
+    async fn consecutive_runs_reuse_multi_turn_conversation() {
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let provider = RecordingProvider {
+            requests: Rc::clone(&requests),
+            responses: VecDeque::from([
+                AgentAction::Final {
+                    message: "first answer".into(),
+                },
+                AgentAction::Final {
+                    message: "second answer".into(),
+                },
+            ]),
+        };
+        let mut agent = Agent::new(provider, MockTools, Allow, |_| {}, "system", 2);
+        agent.run("first question").await.unwrap();
+        agent.run("second question").await.unwrap();
+
+        let requests = requests.borrow();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].items.iter().any(|item| matches!(
+            item,
+            ConversationItem::Message { role: Role::Assistant, content }
+                if content == "first answer"
+        )));
+        assert!(requests[1].items.iter().any(|item| matches!(
+            item,
+            ConversationItem::Message { role: Role::User, content }
+                if content == "second question"
+        )));
     }
 }
