@@ -40,6 +40,8 @@ Every Rust build stores original file contents under `.codehelm/checkpoints` bef
 
 Rust sessions are atomically persisted under `.codehelm/sessions` after every conversation transition, with an append-only NDJSON event journal. Continue the latest run with `codehelm resume latest "continue with the failing test"`.
 
+Pressing Ctrl-C cancels an active provider stream or command, journals the interruption, preserves the last durable conversation state and edit checkpoint, and exits with status 130.
+
 When launched from a nested directory, the Rust CLI discovers the nearest CodeHelm or Git project root. It loads `AGENTS.md` and `CLAUDE.md` files from the root down to the invocation directory, with deeper instructions applied later and a configurable `maxInstructionChars` context limit.
 
 ## Features

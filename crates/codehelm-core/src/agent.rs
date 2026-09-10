@@ -15,6 +15,8 @@ pub enum AgentError {
     MaxTurns(usize),
     #[error("session persistence failed: {0}")]
     Session(String),
+    #[error("agent run cancelled")]
+    Cancelled,
 }
 
 /// Provider boundary. Implementations translate vendor-native streaming and tool

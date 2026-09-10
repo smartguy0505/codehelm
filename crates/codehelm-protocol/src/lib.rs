@@ -80,6 +80,9 @@ pub enum AgentEvent {
         id: String,
         resumed: bool,
     },
+    Cancelled {
+        reason: String,
+    },
     Turn {
         turn: usize,
     },

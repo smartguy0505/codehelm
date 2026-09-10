@@ -95,7 +95,14 @@ async fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("codehelm: {error}");
-            ExitCode::FAILURE
+            if matches!(
+                error.downcast_ref::<codehelm_core::AgentError>(),
+                Some(codehelm_core::AgentError::Cancelled)
+            ) {
+                ExitCode::from(130)
+            } else {
+                ExitCode::FAILURE
+            }
         }
     }
 }
@@ -291,6 +298,7 @@ async fn run_agent_with_session(
     recorder.append_event(&session_event)?;
     render_event(session_event, json);
     let initial_items = recorder.items();
+    let cancel_recorder = recorder.clone();
     let event_recorder = recorder.clone();
     let mut events = move |event: AgentEvent| {
         if let Err(error) = event_recorder.append_event(&event) {
@@ -312,7 +320,16 @@ async fn run_agent_with_session(
         agent
     };
     let mut agent = agent.with_store(recorder);
-    agent.run(task).await?;
+    tokio::select! {
+        result = agent.run(task) => { result?; }
+        signal = tokio::signal::ctrl_c() => {
+            signal?;
+            let event = AgentEvent::Cancelled { reason: "interrupt".into() };
+            cancel_recorder.append_event(&event)?;
+            render_event(event, json);
+            return Err(codehelm_core::AgentError::Cancelled.into());
+        }
+    }
     Ok(())
 }
 
@@ -349,6 +366,7 @@ fn render_event(event: AgentEvent, json: bool) {
         AgentEvent::SessionStarted { id, resumed } => {
             eprintln!("session {id}{}", if resumed { " (resumed)" } else { "" });
         }
+        AgentEvent::Cancelled { reason } => eprintln!("cancelled: {reason}"),
         AgentEvent::ModelComplete { .. } => println!(),
         AgentEvent::ToolStart { tool, reason, .. } => {
             if let Some(reason) = reason {
