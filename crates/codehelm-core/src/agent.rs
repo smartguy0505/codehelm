@@ -1,0 +1,255 @@
+use async_trait::async_trait;
+use codehelm_protocol::{AgentAction, AgentEvent, Message, ModelRequest, Role, ToolSpec};
+use serde_json::Value;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum AgentError {
+    #[error("provider failed: {0}")]
+    Provider(String),
+    #[error("tool {tool} failed: {message}")]
+    Tool { tool: String, message: String },
+    #[error("agent exceeded {0} turns")]
+    MaxTurns(usize),
+}
+
+/// Provider boundary. Implementations translate vendor-native streaming and tool
+/// calls into the stable CodeHelm protocol before returning an action.
+#[async_trait(?Send)]
+pub trait ModelProvider {
+    async fn respond(
+        &mut self,
+        request: &ModelRequest,
+        events: &mut dyn EventSink,
+    ) -> Result<AgentAction, AgentError>;
+}
+
+#[async_trait(?Send)]
+pub trait ToolExecutor {
+    fn specs(&self) -> Vec<ToolSpec>;
+
+    async fn execute(&mut self, tool: &str, args: &Value) -> Result<String, AgentError>;
+}
+
+#[async_trait(?Send)]
+pub trait ApprovalHandler {
+    async fn approve(&mut self, tool: &str, args: &Value, reason: Option<&str>) -> bool;
+}
+
+pub trait EventSink {
+    fn emit(&mut self, event: AgentEvent);
+}
+
+impl<F> EventSink for F
+where
+    F: FnMut(AgentEvent),
+{
+    fn emit(&mut self, event: AgentEvent) {
+        self(event);
+    }
+}
+
+pub struct Agent<P, T, A, E> {
+    provider: P,
+    tools: T,
+    approvals: A,
+    events: E,
+    messages: Vec<Message>,
+    max_turns: usize,
+}
+
+impl<P, T, A, E> Agent<P, T, A, E>
+where
+    P: ModelProvider,
+    T: ToolExecutor,
+    A: ApprovalHandler,
+    E: EventSink,
+{
+    pub fn new(
+        provider: P,
+        tools: T,
+        approvals: A,
+        events: E,
+        system_prompt: impl Into<String>,
+        max_turns: usize,
+    ) -> Self {
+        Self {
+            provider,
+            tools,
+            approvals,
+            events,
+            messages: vec![Message {
+                role: Role::System,
+                content: system_prompt.into(),
+            }],
+            max_turns,
+        }
+    }
+
+    pub async fn run(&mut self, prompt: impl Into<String>) -> Result<String, AgentError> {
+        self.messages.push(Message {
+            role: Role::User,
+            content: prompt.into(),
+        });
+
+        for turn in 1..=self.max_turns {
+            self.events.emit(AgentEvent::Turn { turn });
+            self.events.emit(AgentEvent::ModelStart { turn });
+            let request = ModelRequest {
+                messages: self.messages.clone(),
+                tools: self.tools.specs(),
+            };
+            let action = self.provider.respond(&request, &mut self.events).await?;
+            self.events.emit(AgentEvent::ModelComplete { turn });
+
+            match action {
+                AgentAction::Final { message } => {
+                    self.messages.push(Message {
+                        role: Role::Assistant,
+                        content: message.clone(),
+                    });
+                    self.events.emit(AgentEvent::Final {
+                        message: message.clone(),
+                        turn,
+                    });
+                    return Ok(message);
+                }
+                AgentAction::Tool { tool, args, reason } => {
+                    self.events.emit(AgentEvent::ToolStart {
+                        tool: tool.clone(),
+                        args: args.clone(),
+                        reason: reason.clone(),
+                    });
+                    if !self
+                        .approvals
+                        .approve(&tool, &args, reason.as_deref())
+                        .await
+                    {
+                        let message = "permission denied".to_owned();
+                        self.events.emit(AgentEvent::ToolDenied {
+                            tool: tool.clone(),
+                            reason: message.clone(),
+                        });
+                        self.push_tool_result(&tool, &message);
+                        continue;
+                    }
+
+                    let result = self.tools.execute(&tool, &args).await?;
+                    self.events.emit(AgentEvent::ToolResult {
+                        tool: tool.clone(),
+                        result: result.clone(),
+                    });
+                    self.push_tool_result(&tool, &result);
+                }
+            }
+        }
+        Err(AgentError::MaxTurns(self.max_turns))
+    }
+
+    fn push_tool_result(&mut self, tool: &str, result: &str) {
+        self.messages.push(Message {
+            role: Role::Assistant,
+            content: format!("tool call: {tool}"),
+        });
+        self.messages.push(Message {
+            role: Role::Tool,
+            content: result.to_owned(),
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+
+    use super::*;
+
+    struct MockProvider(VecDeque<AgentAction>);
+
+    #[async_trait(?Send)]
+    impl ModelProvider for MockProvider {
+        async fn respond(
+            &mut self,
+            _request: &ModelRequest,
+            events: &mut dyn EventSink,
+        ) -> Result<AgentAction, AgentError> {
+            events.emit(AgentEvent::ModelDelta { delta: "ok".into() });
+            Ok(self.0.pop_front().expect("mock response"))
+        }
+    }
+
+    struct MockTools;
+
+    #[async_trait(?Send)]
+    impl ToolExecutor for MockTools {
+        fn specs(&self) -> Vec<ToolSpec> {
+            vec![ToolSpec {
+                name: "read_file".into(),
+                description: "Read a file".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }]
+        }
+
+        async fn execute(&mut self, tool: &str, _args: &Value) -> Result<String, AgentError> {
+            assert_eq!(tool, "read_file");
+            Ok("contents".into())
+        }
+    }
+
+    struct Allow;
+
+    #[async_trait(?Send)]
+    impl ApprovalHandler for Allow {
+        async fn approve(&mut self, _tool: &str, _args: &Value, _reason: Option<&str>) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn executes_tool_and_finishes() {
+        let provider = MockProvider(VecDeque::from([
+            AgentAction::Tool {
+                tool: "read_file".into(),
+                args: serde_json::json!({"path": "README.md"}),
+                reason: Some("inspect".into()),
+            },
+            AgentAction::Final {
+                message: "done".into(),
+            },
+        ]));
+        let mut events = Vec::new();
+        let mut agent = Agent::new(
+            provider,
+            MockTools,
+            Allow,
+            |event| events.push(event),
+            "system",
+            3,
+        );
+
+        assert_eq!(agent.run("task").await.unwrap(), "done");
+        assert!(events.iter().any(
+            |event| matches!(event, AgentEvent::ToolResult { result, .. } if result == "contents")
+        ));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ModelDelta { delta } if delta == "ok"))
+        );
+    }
+
+    #[tokio::test]
+    async fn stops_at_turn_limit() {
+        let provider = MockProvider(VecDeque::from([AgentAction::Tool {
+            tool: "read_file".into(),
+            args: Value::Null,
+            reason: None,
+        }]));
+        let mut agent = Agent::new(provider, MockTools, Allow, |_| {}, "system", 1);
+
+        assert!(matches!(
+            agent.run("task").await,
+            Err(AgentError::MaxTurns(1))
+        ));
+    }
+}
