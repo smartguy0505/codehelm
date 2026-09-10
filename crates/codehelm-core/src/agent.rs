@@ -47,6 +47,13 @@ pub trait ApprovalHandler {
     async fn approve(&mut self, tool: &str, args: &Value, reason: Option<&str>) -> bool;
 }
 
+#[async_trait(?Send)]
+impl<T: ApprovalHandler + ?Sized> ApprovalHandler for Box<T> {
+    async fn approve(&mut self, tool: &str, args: &Value, reason: Option<&str>) -> bool {
+        (**self).approve(tool, args, reason).await
+    }
+}
+
 pub trait EventSink {
     fn emit(&mut self, event: AgentEvent);
 }
@@ -160,7 +167,10 @@ where
                         continue;
                     }
 
-                    let result = self.tools.execute(&tool, &args).await?;
+                    let result = match self.tools.execute(&tool, &args).await {
+                        Ok(result) => result,
+                        Err(error) => format!("Tool error: {error}"),
+                    };
                     self.events.emit(AgentEvent::ToolResult {
                         tool: tool.clone(),
                         result: result.clone(),

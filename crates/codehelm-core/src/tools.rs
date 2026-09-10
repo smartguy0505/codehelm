@@ -1,5 +1,7 @@
 use std::{
+    collections::HashMap,
     fs,
+    io::Write,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -17,6 +19,8 @@ pub struct WorkspaceTools {
     root: PathBuf,
     policy: PermissionPolicy,
     max_output_chars: usize,
+    writable: bool,
+    snapshots: HashMap<PathBuf, Option<Vec<u8>>>,
 }
 
 impl WorkspaceTools {
@@ -30,7 +34,14 @@ impl WorkspaceTools {
             root,
             policy,
             max_output_chars,
+            writable: false,
+            snapshots: HashMap::new(),
         })
+    }
+
+    pub fn enable_edits(mut self) -> Self {
+        self.writable = true;
+        self
     }
 
     fn relative(&self, requested: &str) -> Result<(PathBuf, PathBuf), AgentError> {
@@ -196,6 +207,83 @@ impl WorkspaceTools {
         }))
     }
 
+    fn write_path(&mut self, requested: &str, content: &[u8]) -> Result<String, AgentError> {
+        if !self.writable {
+            return Err(tool_error("write_file", "editing is disabled"));
+        }
+        let relative = PathBuf::from(requested);
+        if self
+            .policy
+            .write_decision(&relative)
+            .map_err(|error| tool_error("permission", error))?
+            == Decision::Deny
+        {
+            return Err(tool_error(
+                "permission",
+                format!("write denied: {requested}"),
+            ));
+        }
+        let target =
+            resolve_inside(&self.root, &relative).map_err(|error| tool_error("path", error))?;
+        if !self.snapshots.contains_key(&relative) {
+            let original = match fs::read(&target) {
+                Ok(data) => Some(data),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(tool_error("snapshot", error)),
+            };
+            self.snapshots.insert(relative.clone(), original);
+        }
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(|error| tool_error("write_file", error))?;
+        }
+        atomic_write(&target, content)?;
+        Ok(format!(
+            "Wrote {} ({} bytes)",
+            normalize(&relative),
+            content.len()
+        ))
+    }
+
+    fn write_file(&mut self, args: &Value) -> Result<String, AgentError> {
+        let path = required_arg(args, "path")?.to_owned();
+        let content = required_arg(args, "content")?.as_bytes().to_vec();
+        self.write_path(&path, &content)
+    }
+
+    fn replace_in_file(&mut self, args: &Value) -> Result<String, AgentError> {
+        let path = required_arg(args, "path")?.to_owned();
+        let old = required_arg(args, "oldText")?;
+        let new = required_arg(args, "newText")?;
+        let (_, target) = self.relative(&path)?;
+        let content =
+            fs::read_to_string(target).map_err(|error| tool_error("replace_in_file", error))?;
+        if content.matches(old).count() != 1 {
+            return Err(tool_error(
+                "replace_in_file",
+                "oldText must occur exactly once",
+            ));
+        }
+        self.write_path(&path, content.replacen(old, new, 1).as_bytes())
+    }
+
+    fn rollback(&mut self) -> Result<String, AgentError> {
+        let snapshots = std::mem::take(&mut self.snapshots);
+        let count = snapshots.len();
+        for (relative, original) in snapshots {
+            let target = resolve_inside(&self.root, &relative)
+                .map_err(|error| tool_error("rollback", error))?;
+            match original {
+                Some(data) => atomic_write(&target, &data)?,
+                None => match fs::remove_file(target) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(tool_error("rollback", error)),
+                },
+            }
+        }
+        Ok(format!("Rolled back {count} file(s)"))
+    }
+
     fn truncate(&self, value: String) -> String {
         if value.chars().count() <= self.max_output_chars {
             return value;
@@ -211,7 +299,7 @@ impl WorkspaceTools {
 #[async_trait(?Send)]
 impl ToolExecutor for WorkspaceTools {
     fn specs(&self) -> Vec<ToolSpec> {
-        vec![
+        let mut specs = vec![
             spec(
                 "list_files",
                 "List workspace files recursively",
@@ -233,7 +321,15 @@ impl ToolExecutor for WorkspaceTools {
                     "type":"object", "properties":{"pattern":{"type":"string"},"path":{"type":"string"}}, "required":["pattern"], "additionalProperties":false
                 }),
             ),
-        ]
+        ];
+        if self.writable {
+            specs.extend([
+                spec("write_file", "Atomically create or replace a workspace file", json!({"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"],"additionalProperties":false})),
+                spec("replace_in_file", "Atomically replace one exact text occurrence", json!({"type":"object","properties":{"path":{"type":"string"},"oldText":{"type":"string"},"newText":{"type":"string"}},"required":["path","oldText","newText"],"additionalProperties":false})),
+                spec("rollback_edits", "Rollback all files changed during this run", json!({"type":"object","properties":{},"additionalProperties":false})),
+            ]);
+        }
+        specs
     }
 
     async fn execute(&mut self, tool: &str, args: &Value) -> Result<String, AgentError> {
@@ -241,6 +337,9 @@ impl ToolExecutor for WorkspaceTools {
             "list_files" => self.list_files(args),
             "read_file" => self.read_file(args),
             "search" => self.search(args),
+            "write_file" => self.write_file(args),
+            "replace_in_file" => self.replace_in_file(args),
+            "rollback_edits" if self.writable => self.rollback(),
             _ => Err(tool_error(tool, "unknown or unavailable tool")),
         }
     }
@@ -252,6 +351,23 @@ pub struct ReadOnlyApproval;
 impl ApprovalHandler for ReadOnlyApproval {
     async fn approve(&mut self, tool: &str, _args: &Value, _reason: Option<&str>) -> bool {
         matches!(tool, "list_files" | "read_file" | "search")
+    }
+}
+
+pub struct BuildApproval;
+
+#[async_trait(?Send)]
+impl ApprovalHandler for BuildApproval {
+    async fn approve(&mut self, tool: &str, _args: &Value, _reason: Option<&str>) -> bool {
+        matches!(
+            tool,
+            "list_files"
+                | "read_file"
+                | "search"
+                | "write_file"
+                | "replace_in_file"
+                | "rollback_edits"
+        )
     }
 }
 
@@ -281,6 +397,25 @@ fn tool_error(tool: &str, error: impl std::fmt::Display) -> AgentError {
         tool: tool.into(),
         message: error.to_string(),
     }
+}
+
+fn atomic_write(target: &Path, content: &[u8]) -> Result<(), AgentError> {
+    let temporary = target.with_extension(format!("codehelm-{}.tmp", std::process::id()));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|error| tool_error("atomic_write", error))?;
+    if let Err(error) = file.write_all(content).and_then(|_| file.sync_all()) {
+        let _ = fs::remove_file(&temporary);
+        return Err(tool_error("atomic_write", error));
+    }
+    drop(file);
+    if let Err(error) = fs::rename(&temporary, target) {
+        let _ = fs::remove_file(&temporary);
+        return Err(tool_error("atomic_write", error));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -333,6 +468,33 @@ mod tests {
                 .await
                 .is_err()
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn edits_can_be_rolled_back() {
+        let root = workspace();
+        let mut tools = WorkspaceTools::new(&root, PermissionPolicy::default(), 1_000)
+            .unwrap()
+            .enable_edits();
+        tools
+            .execute(
+                "replace_in_file",
+                &json!({"path":"src/lib.rs","oldText":"needle","newText":"changed"}),
+            )
+            .await
+            .unwrap();
+        tools
+            .execute("write_file", &json!({"path":"new.txt","content":"new"}))
+            .await
+            .unwrap();
+        tools.execute("rollback_edits", &json!({})).await.unwrap();
+        assert!(
+            fs::read_to_string(root.join("src/lib.rs"))
+                .unwrap()
+                .contains("needle")
+        );
+        assert!(!root.join("new.txt").exists());
         fs::remove_dir_all(root).unwrap();
     }
 }

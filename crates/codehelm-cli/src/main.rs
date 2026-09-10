@@ -7,8 +7,9 @@ use std::{
 
 use clap::{Parser, Subcommand, ValueEnum};
 use codehelm_core::{
-    Agent, AnthropicProvider, Config, ModelProvider, OpenAiProvider, Provider, ReadOnlyApproval,
-    WorkspaceTools, config::ConfigOverrides, load_config,
+    Agent, AnthropicProvider, ApprovalHandler, BuildApproval, Config, ModelProvider,
+    OpenAiProvider, Provider, ReadOnlyApproval, WorkspaceTools, config::ConfigOverrides,
+    load_config,
 };
 use codehelm_protocol::AgentEvent;
 use tracing_subscriber::EnvFilter;
@@ -107,6 +108,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Config => println!("{}", serde_json::to_string_pretty(&config)?),
         Command::Plan { task } => run_agent(&cwd, &config, &task, "plan", cli.json).await?,
         Command::Exec { task } => run_agent(&cwd, &config, &task, "exec", cli.json).await?,
+        Command::Build { task } => run_agent(&cwd, &config, &task, "build", cli.json).await?,
         Command::Review { focus } => {
             let task = focus.map_or_else(
                 || "Review the current repository changes.".into(),
@@ -147,20 +149,29 @@ async fn run_agent(
         }
         Provider::Ollama => return Err("the native Ollama adapter is not implemented yet".into()),
     };
-    let tools = WorkspaceTools::new(
+    let mut tools = WorkspaceTools::new(
         cwd,
         config.permissions.clone(),
         config.max_tool_output_chars,
     )?;
+    let writable = mode == "build";
+    if writable {
+        tools = tools.enable_edits();
+    }
+    let approvals: Box<dyn ApprovalHandler> = if writable {
+        Box::new(BuildApproval)
+    } else {
+        Box::new(ReadOnlyApproval)
+    };
     let instructions = project_instructions(cwd)?;
     let system = format!(
-        "You are CodeHelm, a careful coding agent. Mode: {mode}. This Rust runtime is read-only: inspect the repository with the provided tools and return a concise, evidence-based answer. Never invent tool results.\n\nProject instructions:\n{instructions}"
+        "You are CodeHelm, a careful coding agent. Mode: {mode}. Inspect before editing, make focused changes, and verify your work. The rollback_edits tool can restore every file changed during this run. Never invent tool results.\n\nProject instructions:\n{instructions}"
     );
     let mut events = move |event: AgentEvent| render_event(event, json);
     let mut agent = Agent::new(
         provider,
         tools,
-        ReadOnlyApproval,
+        approvals,
         &mut events,
         system,
         config.max_turns,

@@ -29,7 +29,7 @@ cargo build --release
 OPENAI_API_KEY="..." ./target/release/codehelm plan "explain this architecture"
 ```
 
-The Rust CLI now supports live, read-only `plan`, `review`, and `exec` runs through OpenAI and Anthropic. Build-mode edits remain on the JavaScript CLI until transactional Rust editing and sandboxed command execution are ready.
+The Rust CLI supports live `plan`, `review`, `exec`, and transactional `build` runs through OpenAI and Anthropic. Build mode snapshots original file contents, writes atomically, and can roll back every edit from the current run.
 
 ## Features
 
@@ -135,7 +135,7 @@ node ./bin/codehelm.js --help
 
 ## Roadmap
 
-- Transactional Rust editing with checkpoints and rollback
+- Sandboxed command execution with explicit approvals
 - Patch-based edits with visual diff approval
 - Git worktree checkpoints and rollback
 - MCP client and plugin/skill system
