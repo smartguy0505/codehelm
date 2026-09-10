@@ -284,11 +284,8 @@ impl WorkspaceTools {
 
     async fn run_command(&self, args: &Value) -> Result<String, AgentError> {
         let command = required_arg(args, "command")?;
-        if self.policy.command_decision(command) != Decision::Allow {
-            return Err(tool_error(
-                "run_command",
-                "command is not explicitly allowlisted",
-            ));
+        if self.policy.command_decision(command) == Decision::Deny {
+            return Err(tool_error("run_command", "command is denied by policy"));
         }
         let parts = shell_words::split(command)
             .map_err(|error| tool_error("run_command", format!("invalid command: {error}")))?;
@@ -366,7 +363,7 @@ impl ToolExecutor for WorkspaceTools {
             ]);
         }
         if self.command_timeout_ms.is_some() {
-            specs.push(spec("run_command", "Run one explicitly allowlisted command without a shell", json!({"type":"object","properties":{"command":{"type":"string"}},"required":["command"],"additionalProperties":false})));
+            specs.push(spec("run_command", "Run one policy-approved command without a shell", json!({"type":"object","properties":{"command":{"type":"string"}},"required":["command"],"additionalProperties":false})));
         }
         specs
     }
@@ -394,21 +391,57 @@ impl ApprovalHandler for ReadOnlyApproval {
     }
 }
 
-pub struct BuildApproval;
+pub struct PolicyApproval<F> {
+    policy: PermissionPolicy,
+    assume_yes: bool,
+    prompt: F,
+}
+
+impl<F> PolicyApproval<F> {
+    pub fn new(policy: PermissionPolicy, assume_yes: bool, prompt: F) -> Self {
+        Self {
+            policy,
+            assume_yes,
+            prompt,
+        }
+    }
+
+    fn decision(&self, tool: &str, args: &Value) -> Decision {
+        match tool {
+            "list_files" | "read_file" | "search" | "rollback_edits" => Decision::Allow,
+            "write_file" | "replace_in_file" => {
+                args["path"].as_str().map_or(Decision::Deny, |path| {
+                    self.policy
+                        .write_decision(Path::new(path))
+                        .unwrap_or(Decision::Deny)
+                })
+            }
+            "run_command" => args["command"].as_str().map_or(Decision::Deny, |command| {
+                self.policy.command_decision(command)
+            }),
+            _ => Decision::Deny,
+        }
+    }
+
+    fn description(tool: &str, args: &Value) -> String {
+        match tool {
+            "run_command" => format!("run command `{}`", args["command"].as_str().unwrap_or("?")),
+            "write_file" | "replace_in_file" => {
+                format!("{tool} `{}`", args["path"].as_str().unwrap_or("?"))
+            }
+            _ => tool.to_owned(),
+        }
+    }
+}
 
 #[async_trait(?Send)]
-impl ApprovalHandler for BuildApproval {
-    async fn approve(&mut self, tool: &str, _args: &Value, _reason: Option<&str>) -> bool {
-        matches!(
-            tool,
-            "list_files"
-                | "read_file"
-                | "search"
-                | "write_file"
-                | "replace_in_file"
-                | "rollback_edits"
-                | "run_command"
-        )
+impl<F: FnMut(&str) -> bool> ApprovalHandler for PolicyApproval<F> {
+    async fn approve(&mut self, tool: &str, args: &Value, _reason: Option<&str>) -> bool {
+        match self.decision(tool, args) {
+            Decision::Allow => true,
+            Decision::Ask => self.assume_yes || (self.prompt)(&Self::description(tool, args)),
+            Decision::Deny => false,
+        }
     }
 }
 
@@ -561,8 +594,40 @@ mod tests {
                 .await
                 .unwrap_err()
                 .to_string()
-                .contains("allowlisted")
+                .contains("denied by policy")
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn policy_approval_prompts_for_unknown_commands_and_never_bypasses_denials() {
+        let mut prompts = Vec::new();
+        let mut approval =
+            PolicyApproval::new(PermissionPolicy::default(), false, |message: &str| {
+                prompts.push(message.to_owned());
+                true
+            });
+        assert!(
+            approval
+                .approve("run_command", &json!({"command":"node script.js"}), None)
+                .await
+        );
+        assert!(
+            !approval
+                .approve("run_command", &json!({"command":"rm -rf build"}), None)
+                .await
+        );
+        drop(approval);
+        assert_eq!(prompts.len(), 1);
+
+        let mut yes = PolicyApproval::new(PermissionPolicy::default(), true, |_: &str| false);
+        assert!(
+            yes.approve("run_command", &json!({"command":"node script.js"}), None)
+                .await
+        );
+        assert!(
+            !yes.approve("run_command", &json!({"command":"sudo reboot"}), None)
+                .await
+        );
     }
 }

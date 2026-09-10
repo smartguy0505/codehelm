@@ -13,6 +13,7 @@ pub struct PermissionPolicy {
     pub allow_commands: Vec<String>,
     pub deny_commands: Vec<String>,
     pub deny_read: Vec<String>,
+    pub ask_write: Vec<String>,
     pub deny_write: Vec<String>,
 }
 
@@ -62,6 +63,7 @@ impl Default for PermissionPolicy {
             .into_iter()
             .map(str::to_owned)
             .collect(),
+            ask_write: Vec::new(),
             deny_write: [
                 ".git/**",
                 ".env",
@@ -130,13 +132,14 @@ impl PermissionPolicy {
     }
 
     pub fn write_decision(&self, path: &Path) -> Result<Decision, PermissionError> {
-        Ok(
-            if build_globs(&self.deny_write)?.is_match(normalize(path)) {
-                Decision::Deny
-            } else {
-                Decision::Allow
-            },
-        )
+        let path = normalize(path);
+        Ok(if build_globs(&self.deny_write)?.is_match(&path) {
+            Decision::Deny
+        } else if build_globs(&self.ask_write)?.is_match(&path) {
+            Decision::Ask
+        } else {
+            Decision::Allow
+        })
     }
 }
 
@@ -246,6 +249,24 @@ mod tests {
         assert_eq!(
             policy.read_decision(Path::new("src/main.rs")).unwrap(),
             Decision::Allow
+        );
+    }
+
+    #[test]
+    fn write_ask_patterns_do_not_override_denials() {
+        let policy = PermissionPolicy {
+            ask_write: vec!["generated/**".into(), ".env".into()],
+            ..PermissionPolicy::default()
+        };
+        assert_eq!(
+            policy
+                .write_decision(Path::new("generated/code.rs"))
+                .unwrap(),
+            Decision::Ask
+        );
+        assert_eq!(
+            policy.write_decision(Path::new(".env")).unwrap(),
+            Decision::Deny
         );
     }
 

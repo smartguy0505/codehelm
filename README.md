@@ -34,6 +34,8 @@ The Rust CLI supports live `plan`, `review`, `exec`, and transactional `build` r
 
 Rust build mode can also run configured allowlisted commands directly, without invoking a shell. Commands are bounded by configured timeout and output limits; OS-level filesystem and network isolation remains on the roadmap.
 
+Commands outside `allowCommands` require an interactive confirmation. Headless runs deny these ask-level actions unless `--yes` is supplied; denylisted commands and protected paths remain blocked even with `--yes`. Paths matching optional `permissions.askWrite` patterns use the same approval flow.
+
 Every Rust build stores original file contents under `.codehelm/checkpoints` before the first write. Interrupted runs can be recovered with `codehelm checkpoints` and `codehelm rollback latest`.
 
 Rust sessions are atomically persisted under `.codehelm/sessions` after every conversation transition, with an append-only NDJSON event journal. Continue the latest run with `codehelm resume latest "continue with the failing test"`.
@@ -108,6 +110,7 @@ Project configuration lives in `.codehelm/config.json`. Global defaults can be p
   "permissions": {
     "allowCommands": ["git status", "git diff", "npm test"],
     "denyCommands": ["rm", "sudo", "git reset --hard"],
+    "askWrite": ["generated/**"],
     "denyRead": [".env", ".env.*", "**/*.pem", "**/*.key"],
     "denyWrite": [".git/**", ".env", "**/*.key"]
   }

@@ -1,14 +1,14 @@
 use std::{
     env, fs,
-    io::{self, Write},
+    io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
     process::ExitCode,
 };
 
 use clap::{Parser, Subcommand, ValueEnum};
 use codehelm_core::{
-    Agent, AnthropicProvider, ApprovalHandler, BuildApproval, Config, ModelProvider,
-    OllamaProvider, OpenAiProvider, Provider, ReadOnlyApproval, SessionRecorder, SessionStore,
+    Agent, AnthropicProvider, ApprovalHandler, Config, ModelProvider, OllamaProvider,
+    OpenAiProvider, PolicyApproval, Provider, ReadOnlyApproval, SessionRecorder, SessionStore,
     WorkspaceTools, config::ConfigOverrides, list_checkpoints, load_config, restore_checkpoint,
 };
 use codehelm_protocol::AgentEvent;
@@ -141,22 +141,29 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let count = restore_checkpoint(&cwd, &id, &config.permissions)?;
             println!("Restored {count} file(s) from checkpoint {id}.");
         }
-        Command::Plan { task } => run_agent(&cwd, &config, &task, "plan", cli.json).await?,
-        Command::Exec { task } => run_agent(&cwd, &config, &task, "exec", cli.json).await?,
-        Command::Build { task } => run_agent(&cwd, &config, &task, "build", cli.json).await?,
+        Command::Plan { task } => {
+            run_agent(&cwd, &config, &task, "plan", cli.json, cli.yes).await?
+        }
+        Command::Exec { task } => {
+            run_agent(&cwd, &config, &task, "exec", cli.json, cli.yes).await?
+        }
+        Command::Build { task } => {
+            run_agent(&cwd, &config, &task, "build", cli.json, cli.yes).await?
+        }
         Command::Resume { session, task } => {
             let store = SessionStore::load(&cwd, session.as_deref().unwrap_or("latest"))?;
             let mode = store.session().mode.clone();
             let task =
                 task.unwrap_or_else(|| "Continue the previous task from the saved context.".into());
-            run_agent_with_session(&cwd, &config, &task, &mode, cli.json, Some(store)).await?;
+            run_agent_with_session(&cwd, &config, &task, &mode, cli.json, cli.yes, Some(store))
+                .await?;
         }
         Command::Review { focus } => {
             let task = focus.map_or_else(
                 || "Review the current repository changes.".into(),
                 |focus| format!("Review the current repository changes, focusing on {focus}."),
             );
-            run_agent(&cwd, &config, &task, "review", cli.json).await?;
+            run_agent(&cwd, &config, &task, "review", cli.json, cli.yes).await?;
         }
         command => print_migration_status(command, &config, cli.json),
     }
@@ -169,8 +176,9 @@ async fn run_agent(
     task: &str,
     mode: &str,
     json: bool,
+    assume_yes: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    run_agent_with_session(cwd, config, task, mode, json, None).await
+    run_agent_with_session(cwd, config, task, mode, json, assume_yes, None).await
 }
 
 async fn run_agent_with_session(
@@ -179,6 +187,7 @@ async fn run_agent_with_session(
     task: &str,
     mode: &str,
     json: bool,
+    assume_yes: bool,
     saved: Option<SessionStore>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let provider: Box<dyn ModelProvider> = match config.provider {
@@ -225,7 +234,12 @@ async fn run_agent_with_session(
             .enable_commands(config.command_timeout_ms);
     }
     let approvals: Box<dyn ApprovalHandler> = if writable {
-        Box::new(BuildApproval)
+        let policy = config.permissions.clone();
+        Box::new(PolicyApproval::new(
+            policy,
+            assume_yes,
+            move |description: &str| prompt_approval(description, !json),
+        ))
     } else {
         Box::new(ReadOnlyApproval)
     };
@@ -269,6 +283,17 @@ async fn run_agent_with_session(
     let mut agent = agent.with_store(recorder);
     agent.run(task).await?;
     Ok(())
+}
+
+fn prompt_approval(description: &str, interactive: bool) -> bool {
+    if !interactive || !io::stdin().is_terminal() {
+        return false;
+    }
+    eprint!("Approve {description}? [y/N] ");
+    let _ = io::stderr().flush();
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer).is_ok()
+        && matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 fn api_key(provider_variable: &str) -> Result<String, Box<dyn std::error::Error>> {
