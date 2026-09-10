@@ -318,7 +318,8 @@ async fn run_agent_with_session(
         system,
         config.max_turns,
     )
-    .with_token_budget(config.max_total_tokens);
+    .with_token_budget(config.max_total_tokens)
+    .with_context_limit(config.max_context_chars);
     let agent = if resumed {
         agent.with_items(initial_items)
     } else {
@@ -383,6 +384,13 @@ fn render_event(event: AgentEvent, json: bool) {
             usage.input_tokens,
             usage.output_tokens,
             usage.total()
+        ),
+        AgentEvent::ContextCompacted {
+            removed_items,
+            retained_items,
+            estimated_chars,
+        } => eprintln!(
+            "context: removed {removed_items} old items; retained {retained_items} (~{estimated_chars} chars)"
         ),
         AgentEvent::ToolStart { tool, reason, .. } => {
             if let Some(reason) = reason {

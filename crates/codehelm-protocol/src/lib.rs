@@ -105,6 +105,11 @@ pub enum AgentEvent {
     ModelStart {
         turn: usize,
     },
+    ContextCompacted {
+        removed_items: usize,
+        retained_items: usize,
+        estimated_chars: usize,
+    },
     ProviderRetry {
         attempt: usize,
         delay_ms: u64,

@@ -46,6 +46,8 @@ Transient connection failures, timeouts, rate limits, and server errors are retr
 
 Provider-reported token usage is normalized across OpenAI, Anthropic, and Ollama, displayed after each model call, and saved in the event journal. Set `maxTotalTokens` to stop a run before it performs another tool action after crossing the budget.
 
+Provider requests use a bounded recent context window while the durable session keeps the complete history. Compaction preserves system instructions and whole tool-call/result units, and emits a journal event whenever older items are omitted.
+
 When launched from a nested directory, the Rust CLI discovers the nearest CodeHelm or Git project root. It loads `AGENTS.md` and `CLAUDE.md` files from the root down to the invocation directory, with deeper instructions applied later and a configurable `maxInstructionChars` context limit.
 
 ## Features
@@ -116,6 +118,7 @@ Project configuration lives in `.codehelm/config.json`. Global defaults can be p
   "model": "gpt-5-mini",
   "maxTurns": 20,
   "maxInstructionChars": 100000,
+  "maxContextChars": 400000,
   "providerMaxRetries": 3,
   "providerRetryBaseMs": 500,
   "maxTotalTokens": 100000,

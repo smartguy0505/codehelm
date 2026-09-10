@@ -6,6 +6,8 @@ use codehelm_protocol::{
 use serde_json::Value;
 use thiserror::Error;
 
+use crate::context::bounded_context;
+
 #[derive(Debug, Error)]
 pub enum AgentError {
     #[error("provider failed: {0}")]
@@ -98,6 +100,7 @@ pub struct Agent<P, T, A, E, S = NoopStore> {
     store: S,
     max_total_tokens: Option<u64>,
     total_tokens: u64,
+    max_context_chars: usize,
 }
 
 impl<P, T, A, E> Agent<P, T, A, E, NoopStore>
@@ -128,6 +131,7 @@ where
             store: NoopStore,
             max_total_tokens: None,
             total_tokens: 0,
+            max_context_chars: usize::MAX,
         }
     }
 
@@ -147,11 +151,17 @@ where
             store,
             max_total_tokens: self.max_total_tokens,
             total_tokens: self.total_tokens,
+            max_context_chars: self.max_context_chars,
         }
     }
 
     pub fn with_token_budget(mut self, max_total_tokens: Option<u64>) -> Self {
         self.max_total_tokens = max_total_tokens;
+        self
+    }
+
+    pub fn with_context_limit(mut self, max_context_chars: usize) -> Self {
+        self.max_context_chars = max_context_chars;
         self
     }
 }
@@ -174,8 +184,16 @@ where
         for turn in 1..=self.max_turns {
             self.events.emit(AgentEvent::Turn { turn });
             self.events.emit(AgentEvent::ModelStart { turn });
+            let context = bounded_context(&self.items, self.max_context_chars);
+            if context.removed_items > 0 {
+                self.events.emit(AgentEvent::ContextCompacted {
+                    removed_items: context.removed_items,
+                    retained_items: context.items.len(),
+                    estimated_chars: context.estimated_chars,
+                });
+            }
             let request = ModelRequest {
-                items: self.items.clone(),
+                items: context.items,
                 tools: self.tools.specs(),
             };
             let mut usage = TokenUsage::default();
