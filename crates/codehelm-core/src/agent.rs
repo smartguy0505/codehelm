@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use codehelm_protocol::{AgentAction, AgentEvent, Message, ModelRequest, Role, ToolSpec};
+use codehelm_protocol::{AgentAction, AgentEvent, ConversationItem, ModelRequest, Role, ToolSpec};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -54,7 +54,7 @@ pub struct Agent<P, T, A, E> {
     tools: T,
     approvals: A,
     events: E,
-    messages: Vec<Message>,
+    items: Vec<ConversationItem>,
     max_turns: usize,
 }
 
@@ -78,7 +78,7 @@ where
             tools,
             approvals,
             events,
-            messages: vec![Message {
+            items: vec![ConversationItem::Message {
                 role: Role::System,
                 content: system_prompt.into(),
             }],
@@ -87,7 +87,7 @@ where
     }
 
     pub async fn run(&mut self, prompt: impl Into<String>) -> Result<String, AgentError> {
-        self.messages.push(Message {
+        self.items.push(ConversationItem::Message {
             role: Role::User,
             content: prompt.into(),
         });
@@ -96,7 +96,7 @@ where
             self.events.emit(AgentEvent::Turn { turn });
             self.events.emit(AgentEvent::ModelStart { turn });
             let request = ModelRequest {
-                messages: self.messages.clone(),
+                items: self.items.clone(),
                 tools: self.tools.specs(),
             };
             let action = self.provider.respond(&request, &mut self.events).await?;
@@ -104,7 +104,7 @@ where
 
             match action {
                 AgentAction::Final { message } => {
-                    self.messages.push(Message {
+                    self.items.push(ConversationItem::Message {
                         role: Role::Assistant,
                         content: message.clone(),
                     });
@@ -114,7 +114,22 @@ where
                     });
                     return Ok(message);
                 }
-                AgentAction::Tool { tool, args, reason } => {
+                AgentAction::Tool {
+                    id,
+                    tool,
+                    args,
+                    reason,
+                } => {
+                    let id = if id.is_empty() {
+                        format!("codehelm-{turn}")
+                    } else {
+                        id
+                    };
+                    self.items.push(ConversationItem::ToolCall {
+                        id: id.clone(),
+                        name: tool.clone(),
+                        args: args.clone(),
+                    });
                     self.events.emit(AgentEvent::ToolStart {
                         tool: tool.clone(),
                         args: args.clone(),
@@ -130,7 +145,7 @@ where
                             tool: tool.clone(),
                             reason: message.clone(),
                         });
-                        self.push_tool_result(&tool, &message);
+                        self.push_tool_result(&id, &message);
                         continue;
                     }
 
@@ -139,21 +154,17 @@ where
                         tool: tool.clone(),
                         result: result.clone(),
                     });
-                    self.push_tool_result(&tool, &result);
+                    self.push_tool_result(&id, &result);
                 }
             }
         }
         Err(AgentError::MaxTurns(self.max_turns))
     }
 
-    fn push_tool_result(&mut self, tool: &str, result: &str) {
-        self.messages.push(Message {
-            role: Role::Assistant,
-            content: format!("tool call: {tool}"),
-        });
-        self.messages.push(Message {
-            role: Role::Tool,
-            content: result.to_owned(),
+    fn push_tool_result(&mut self, id: &str, result: &str) {
+        self.items.push(ConversationItem::ToolResult {
+            id: id.to_owned(),
+            output: result.to_owned(),
         });
     }
 }
@@ -209,6 +220,7 @@ mod tests {
     async fn executes_tool_and_finishes() {
         let provider = MockProvider(VecDeque::from([
             AgentAction::Tool {
+                id: "call-1".into(),
                 tool: "read_file".into(),
                 args: serde_json::json!({"path": "README.md"}),
                 reason: Some("inspect".into()),
@@ -241,6 +253,7 @@ mod tests {
     #[tokio::test]
     async fn stops_at_turn_limit() {
         let provider = MockProvider(VecDeque::from([AgentAction::Tool {
+            id: "call-1".into(),
             tool: "read_file".into(),
             args: Value::Null,
             reason: None,

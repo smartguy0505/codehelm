@@ -3,19 +3,30 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Message {
-    pub role: Role,
-    pub content: String,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
     System,
     User,
     Assistant,
-    Tool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ConversationItem {
+    Message {
+        role: Role,
+        content: String,
+    },
+    ToolCall {
+        id: String,
+        name: String,
+        args: Value,
+    },
+    ToolResult {
+        id: String,
+        output: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -27,7 +38,7 @@ pub struct ToolSpec {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelRequest {
-    pub messages: Vec<Message>,
+    pub items: Vec<ConversationItem>,
     pub tools: Vec<ToolSpec>,
 }
 
@@ -35,6 +46,8 @@ pub struct ModelRequest {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentAction {
     Tool {
+        #[serde(default)]
+        id: String,
         tool: String,
         #[serde(default)]
         args: Value,
