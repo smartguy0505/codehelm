@@ -5,16 +5,32 @@ use codehelm_protocol::{
     AgentAction, AgentEvent, ConversationItem, ModelRequest, Role, ToolCallRequest,
 };
 use futures_util::StreamExt;
-use reqwest::{Client, Response};
+use reqwest::{Client, RequestBuilder, Response, StatusCode, header::RETRY_AFTER};
 use serde_json::{Value, json};
 
 use crate::agent::{AgentError, EventSink, ModelProvider};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryPolicy {
+    pub max_retries: usize,
+    pub base_delay_ms: u64,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_retries: 3,
+            base_delay_ms: 500,
+        }
+    }
+}
 
 pub struct OpenAiProvider {
     client: Client,
     api_key: String,
     base_url: String,
     model: String,
+    retry: RetryPolicy,
 }
 
 impl OpenAiProvider {
@@ -32,7 +48,13 @@ impl OpenAiProvider {
             api_key: api_key.into(),
             base_url: base_url.into().trim_end_matches('/').to_owned(),
             model: model.into(),
+            retry: RetryPolicy::default(),
         }
+    }
+
+    pub fn with_retry_policy(mut self, retry: RetryPolicy) -> Self {
+        self.retry = retry;
+        self
     }
 }
 
@@ -43,14 +65,12 @@ impl ModelProvider for OpenAiProvider {
         request: &ModelRequest,
         events: &mut dyn EventSink,
     ) -> Result<AgentAction, AgentError> {
-        let response = self
+        let request = self
             .client
             .post(format!("{}/responses", self.base_url))
             .bearer_auth(&self.api_key)
-            .json(&openai_request(&self.model, request))
-            .send()
-            .await
-            .map_err(provider_error)?;
+            .json(&openai_request(&self.model, request));
+        let response = send_with_retry(request, self.retry, events).await?;
         let mut state = OpenAiState::default();
         stream_sse(response, |event| state.consume(event, events)).await?;
         state.finish()
@@ -163,6 +183,7 @@ pub struct AnthropicProvider {
     base_url: String,
     model: String,
     max_tokens: usize,
+    retry: RetryPolicy,
 }
 
 impl AnthropicProvider {
@@ -181,7 +202,13 @@ impl AnthropicProvider {
             base_url: base_url.into().trim_end_matches('/').to_owned(),
             model: model.into(),
             max_tokens: 8_192,
+            retry: RetryPolicy::default(),
         }
+    }
+
+    pub fn with_retry_policy(mut self, retry: RetryPolicy) -> Self {
+        self.retry = retry;
+        self
     }
 }
 
@@ -192,15 +219,13 @@ impl ModelProvider for AnthropicProvider {
         request: &ModelRequest,
         events: &mut dyn EventSink,
     ) -> Result<AgentAction, AgentError> {
-        let response = self
+        let request = self
             .client
             .post(format!("{}/v1/messages", self.base_url))
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
-            .json(&anthropic_request(&self.model, self.max_tokens, request))
-            .send()
-            .await
-            .map_err(provider_error)?;
+            .json(&anthropic_request(&self.model, self.max_tokens, request));
+        let response = send_with_retry(request, self.retry, events).await?;
         let mut state = AnthropicState::default();
         stream_sse(response, |event| state.consume(event, events)).await?;
         state.finish()
@@ -346,6 +371,7 @@ pub struct OllamaProvider {
     client: Client,
     base_url: String,
     model: String,
+    retry: RetryPolicy,
 }
 
 impl OllamaProvider {
@@ -364,7 +390,13 @@ impl OllamaProvider {
             client: Client::new(),
             base_url: base_url.trim_end_matches('/').to_owned(),
             model: model.into(),
+            retry: RetryPolicy::default(),
         }
+    }
+
+    pub fn with_retry_policy(mut self, retry: RetryPolicy) -> Self {
+        self.retry = retry;
+        self
     }
 }
 
@@ -375,13 +407,11 @@ impl ModelProvider for OllamaProvider {
         request: &ModelRequest,
         events: &mut dyn EventSink,
     ) -> Result<AgentAction, AgentError> {
-        let response = self
+        let request = self
             .client
             .post(format!("{}/api/chat", self.base_url))
-            .json(&ollama_request(&self.model, request))
-            .send()
-            .await
-            .map_err(provider_error)?;
+            .json(&ollama_request(&self.model, request));
+        let response = send_with_retry(request, self.retry, events).await?;
         let mut state = OllamaState::default();
         stream_ndjson(response, |chunk| state.consume(chunk, events)).await?;
         state.finish()
@@ -509,6 +539,67 @@ fn role_name(role: Role) -> &'static str {
         Role::User => "user",
         Role::Assistant => "assistant",
     }
+}
+
+async fn send_with_retry(
+    request: RequestBuilder,
+    policy: RetryPolicy,
+    events: &mut dyn EventSink,
+) -> Result<Response, AgentError> {
+    for retry in 0..=policy.max_retries {
+        let attempt = request.try_clone().ok_or_else(|| {
+            AgentError::Provider("provider request body cannot be retried".into())
+        })?;
+        match attempt.send().await {
+            Ok(response) if retryable_status(response.status()) && retry < policy.max_retries => {
+                let reason = format!("HTTP {}", response.status());
+                let delay_ms = retry_after_ms(&response)
+                    .unwrap_or_else(|| backoff_ms(policy.base_delay_ms, retry));
+                events.emit(AgentEvent::ProviderRetry {
+                    attempt: retry + 1,
+                    delay_ms,
+                    reason,
+                });
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+            Ok(response) => return Ok(response),
+            Err(error) if retryable_error(&error) && retry < policy.max_retries => {
+                let delay_ms = backoff_ms(policy.base_delay_ms, retry);
+                events.emit(AgentEvent::ProviderRetry {
+                    attempt: retry + 1,
+                    delay_ms,
+                    reason: error.to_string(),
+                });
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+            Err(error) => return Err(provider_error(error)),
+        }
+    }
+    unreachable!("retry loop always returns on its final attempt")
+}
+
+fn retryable_status(status: StatusCode) -> bool {
+    matches!(status.as_u16(), 408 | 409 | 429) || status.is_server_error()
+}
+
+fn retryable_error(error: &reqwest::Error) -> bool {
+    error.is_connect() || error.is_timeout()
+}
+
+fn retry_after_ms(response: &Response) -> Option<u64> {
+    response
+        .headers()
+        .get(RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .parse::<u64>()
+        .ok()
+        .map(|seconds| seconds.saturating_mul(1_000).min(60_000))
+}
+
+fn backoff_ms(base: u64, retry: usize) -> u64 {
+    base.saturating_mul(1_u64.checked_shl(retry.min(16) as u32).unwrap_or(u64::MAX))
+        .min(30_000)
 }
 
 async fn stream_sse(
@@ -807,5 +898,17 @@ mod tests {
         assert!(
             matches!(state.finish().unwrap(), AgentAction::Tools { calls } if calls.len() == 2 && calls[1].tool == "search")
         );
+    }
+
+    #[test]
+    fn retry_policy_is_bounded_and_status_specific() {
+        assert!(retryable_status(StatusCode::REQUEST_TIMEOUT));
+        assert!(retryable_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(retryable_status(StatusCode::BAD_GATEWAY));
+        assert!(!retryable_status(StatusCode::BAD_REQUEST));
+        assert!(!retryable_status(StatusCode::UNAUTHORIZED));
+        assert_eq!(backoff_ms(500, 0), 500);
+        assert_eq!(backoff_ms(500, 3), 4_000);
+        assert_eq!(backoff_ms(500, 20), 30_000);
     }
 }

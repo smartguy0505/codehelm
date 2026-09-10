@@ -8,9 +8,9 @@ use std::{
 use clap::{Parser, Subcommand, ValueEnum};
 use codehelm_core::{
     Agent, AnthropicProvider, ApprovalHandler, Config, ModelProvider, OllamaProvider,
-    OpenAiProvider, PolicyApproval, Provider, ReadOnlyApproval, SessionRecorder, SessionStore,
-    WorkspaceTools, config::ConfigOverrides, discover_workspace, list_checkpoints, load_config,
-    load_project_instructions, restore_checkpoint,
+    OpenAiProvider, PolicyApproval, Provider, ReadOnlyApproval, RetryPolicy, SessionRecorder,
+    SessionStore, WorkspaceTools, config::ConfigOverrides, discover_workspace, list_checkpoints,
+    load_config, load_project_instructions, restore_checkpoint,
 };
 use codehelm_protocol::AgentEvent;
 use tracing_subscriber::EnvFilter;
@@ -227,6 +227,10 @@ async fn run_agent_with_session(
     saved: Option<SessionStore>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let RunOptions { json, assume_yes } = options;
+    let retry = RetryPolicy {
+        max_retries: config.provider_max_retries,
+        base_delay_ms: config.provider_retry_base_ms,
+    };
     let provider: Box<dyn ModelProvider> = match config.provider {
         Provider::Openai | Provider::OpenaiCompatible => {
             let key = api_key("OPENAI_API_KEY")?;
@@ -235,7 +239,7 @@ async fn run_agent_with_session(
             } else {
                 OpenAiProvider::new(key, &config.model)
             };
-            Box::new(provider)
+            Box::new(provider.with_retry_policy(retry))
         }
         Provider::Anthropic => {
             let key = api_key("ANTHROPIC_API_KEY")?;
@@ -244,7 +248,7 @@ async fn run_agent_with_session(
             } else {
                 AnthropicProvider::new(key, &config.model)
             };
-            Box::new(provider)
+            Box::new(provider.with_retry_policy(retry))
         }
         Provider::Ollama => {
             let base_url = config
@@ -256,7 +260,7 @@ async fn run_agent_with_session(
             } else {
                 OllamaProvider::new(&config.model)
             };
-            Box::new(provider)
+            Box::new(provider.with_retry_policy(retry))
         }
     };
     let mut tools = WorkspaceTools::new(
@@ -368,6 +372,11 @@ fn render_event(event: AgentEvent, json: bool) {
         }
         AgentEvent::Cancelled { reason } => eprintln!("cancelled: {reason}"),
         AgentEvent::ModelComplete { .. } => println!(),
+        AgentEvent::ProviderRetry {
+            attempt,
+            delay_ms,
+            reason,
+        } => eprintln!("provider retry {attempt} in {delay_ms}ms: {reason}"),
         AgentEvent::ToolStart { tool, reason, .. } => {
             if let Some(reason) = reason {
                 eprintln!("→ {tool}: {reason}");

@@ -42,6 +42,8 @@ Rust sessions are atomically persisted under `.codehelm/sessions` after every co
 
 Pressing Ctrl-C cancels an active provider stream or command, journals the interruption, preserves the last durable conversation state and edit checkpoint, and exits with status 130.
 
+Transient connection failures, timeouts, rate limits, and server errors are retried before streaming begins with bounded exponential backoff. Retry attempts are journaled and exposed in NDJSON output; partial streams are never replayed automatically.
+
 When launched from a nested directory, the Rust CLI discovers the nearest CodeHelm or Git project root. It loads `AGENTS.md` and `CLAUDE.md` files from the root down to the invocation directory, with deeper instructions applied later and a configurable `maxInstructionChars` context limit.
 
 ## Features
@@ -112,6 +114,8 @@ Project configuration lives in `.codehelm/config.json`. Global defaults can be p
   "model": "gpt-5-mini",
   "maxTurns": 20,
   "maxInstructionChars": 100000,
+  "providerMaxRetries": 3,
+  "providerRetryBaseMs": 500,
   "permissions": {
     "allowCommands": ["git status", "git diff", "npm test"],
     "denyCommands": ["rm", "sudo", "git reset --hard"],

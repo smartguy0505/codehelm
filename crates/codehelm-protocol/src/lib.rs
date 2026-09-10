@@ -89,6 +89,11 @@ pub enum AgentEvent {
     ModelStart {
         turn: usize,
     },
+    ProviderRetry {
+        attempt: usize,
+        delay_ms: u64,
+        reason: String,
+    },
     ModelDelta {
         delta: String,
     },
