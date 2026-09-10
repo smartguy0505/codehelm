@@ -8,8 +8,8 @@ use std::{
 use clap::{Parser, Subcommand, ValueEnum};
 use codehelm_core::{
     Agent, AnthropicProvider, ApprovalHandler, BuildApproval, Config, ModelProvider,
-    OpenAiProvider, Provider, ReadOnlyApproval, WorkspaceTools, config::ConfigOverrides,
-    list_checkpoints, load_config, restore_checkpoint,
+    OpenAiProvider, Provider, ReadOnlyApproval, SessionRecorder, SessionStore, WorkspaceTools,
+    config::ConfigOverrides, list_checkpoints, load_config, restore_checkpoint,
 };
 use codehelm_protocol::AgentEvent;
 use tracing_subscriber::EnvFilter;
@@ -57,13 +57,26 @@ impl From<ProviderArg> for Provider {
 #[derive(Debug, Subcommand)]
 enum Command {
     Chat,
-    Build { task: String },
-    Plan { task: String },
-    Review { focus: Option<String> },
-    Exec { task: String },
-    Resume { session: Option<String> },
+    Build {
+        task: String,
+    },
+    Plan {
+        task: String,
+    },
+    Review {
+        focus: Option<String>,
+    },
+    Exec {
+        task: String,
+    },
+    Resume {
+        session: Option<String>,
+        task: Option<String>,
+    },
     Checkpoints,
-    Rollback { checkpoint: String },
+    Rollback {
+        checkpoint: String,
+    },
     Init,
     Config,
 }
@@ -131,6 +144,13 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Plan { task } => run_agent(&cwd, &config, &task, "plan", cli.json).await?,
         Command::Exec { task } => run_agent(&cwd, &config, &task, "exec", cli.json).await?,
         Command::Build { task } => run_agent(&cwd, &config, &task, "build", cli.json).await?,
+        Command::Resume { session, task } => {
+            let store = SessionStore::load(&cwd, session.as_deref().unwrap_or("latest"))?;
+            let mode = store.session().mode.clone();
+            let task =
+                task.unwrap_or_else(|| "Continue the previous task from the saved context.".into());
+            run_agent_with_session(&cwd, &config, &task, &mode, cli.json, Some(store)).await?;
+        }
         Command::Review { focus } => {
             let task = focus.map_or_else(
                 || "Review the current repository changes.".into(),
@@ -149,6 +169,17 @@ async fn run_agent(
     task: &str,
     mode: &str,
     json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    run_agent_with_session(cwd, config, task, mode, json, None).await
+}
+
+async fn run_agent_with_session(
+    cwd: &Path,
+    config: &Config,
+    task: &str,
+    mode: &str,
+    json: bool,
+    saved: Option<SessionStore>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let provider: Box<dyn ModelProvider> = match config.provider {
         Provider::Openai | Provider::OpenaiCompatible => {
@@ -191,8 +222,27 @@ async fn run_agent(
     let system = format!(
         "You are CodeHelm, a careful coding agent. Mode: {mode}. Inspect before editing, make focused changes, and verify your work. The rollback_edits tool can restore every file changed during this run. Never invent tool results.\n\nProject instructions:\n{instructions}"
     );
-    let mut events = move |event: AgentEvent| render_event(event, json);
-    let mut agent = Agent::new(
+    let resumed = saved.is_some();
+    let store = match saved {
+        Some(store) => store,
+        None => SessionStore::create(cwd, mode, config.provider.to_string(), &config.model)?,
+    };
+    let recorder = SessionRecorder::new(store);
+    let session_event = AgentEvent::SessionStarted {
+        id: recorder.id(),
+        resumed,
+    };
+    recorder.append_event(&session_event)?;
+    render_event(session_event, json);
+    let initial_items = recorder.items();
+    let event_recorder = recorder.clone();
+    let mut events = move |event: AgentEvent| {
+        if let Err(error) = event_recorder.append_event(&event) {
+            eprintln!("codehelm: {error}");
+        }
+        render_event(event, json);
+    };
+    let agent = Agent::new(
         provider,
         tools,
         approvals,
@@ -200,6 +250,12 @@ async fn run_agent(
         system,
         config.max_turns,
     );
+    let agent = if resumed {
+        agent.with_items(initial_items)
+    } else {
+        agent
+    };
+    let mut agent = agent.with_store(recorder);
     agent.run(task).await?;
     Ok(())
 }
@@ -238,6 +294,9 @@ fn render_event(event: AgentEvent, json: bool) {
         AgentEvent::ModelDelta { delta } => {
             print!("{delta}");
             let _ = io::stdout().flush();
+        }
+        AgentEvent::SessionStarted { id, resumed } => {
+            eprintln!("session {id}{}", if resumed { " (resumed)" } else { "" });
         }
         AgentEvent::ModelComplete { .. } => println!(),
         AgentEvent::ToolStart { tool, reason, .. } => {
@@ -285,8 +344,11 @@ fn print_migration_status(command: Command, config: &Config, json: bool) {
         Command::Plan { .. } => "plan",
         Command::Review { .. } => "review",
         Command::Exec { .. } => "exec",
-        Command::Resume { .. } => "resume",
-        Command::Init | Command::Config | Command::Checkpoints | Command::Rollback { .. } => {
+        Command::Init
+        | Command::Config
+        | Command::Checkpoints
+        | Command::Rollback { .. }
+        | Command::Resume { .. } => {
             unreachable!()
         }
     };

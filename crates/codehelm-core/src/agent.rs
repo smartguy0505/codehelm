@@ -11,6 +11,8 @@ pub enum AgentError {
     Tool { tool: String, message: String },
     #[error("agent exceeded {0} turns")]
     MaxTurns(usize),
+    #[error("session persistence failed: {0}")]
+    Session(String),
 }
 
 /// Provider boundary. Implementations translate vendor-native streaming and tool
@@ -58,6 +60,18 @@ pub trait EventSink {
     fn emit(&mut self, event: AgentEvent);
 }
 
+pub trait ConversationStore {
+    fn save(&mut self, items: &[ConversationItem]) -> Result<(), AgentError>;
+}
+
+pub struct NoopStore;
+
+impl ConversationStore for NoopStore {
+    fn save(&mut self, _items: &[ConversationItem]) -> Result<(), AgentError> {
+        Ok(())
+    }
+}
+
 impl<F> EventSink for F
 where
     F: FnMut(AgentEvent),
@@ -67,16 +81,17 @@ where
     }
 }
 
-pub struct Agent<P, T, A, E> {
+pub struct Agent<P, T, A, E, S = NoopStore> {
     provider: P,
     tools: T,
     approvals: A,
     events: E,
     items: Vec<ConversationItem>,
     max_turns: usize,
+    store: S,
 }
 
-impl<P, T, A, E> Agent<P, T, A, E>
+impl<P, T, A, E> Agent<P, T, A, E, NoopStore>
 where
     P: ModelProvider,
     T: ToolExecutor,
@@ -101,14 +116,42 @@ where
                 content: system_prompt.into(),
             }],
             max_turns,
+            store: NoopStore,
         }
     }
 
+    pub fn with_items(mut self, items: Vec<ConversationItem>) -> Self {
+        self.items = items;
+        self
+    }
+
+    pub fn with_store<S: ConversationStore>(self, store: S) -> Agent<P, T, A, E, S> {
+        Agent {
+            provider: self.provider,
+            tools: self.tools,
+            approvals: self.approvals,
+            events: self.events,
+            items: self.items,
+            max_turns: self.max_turns,
+            store,
+        }
+    }
+}
+
+impl<P, T, A, E, S> Agent<P, T, A, E, S>
+where
+    P: ModelProvider,
+    T: ToolExecutor,
+    A: ApprovalHandler,
+    E: EventSink,
+    S: ConversationStore,
+{
     pub async fn run(&mut self, prompt: impl Into<String>) -> Result<String, AgentError> {
         self.items.push(ConversationItem::Message {
             role: Role::User,
             content: prompt.into(),
         });
+        self.store.save(&self.items)?;
 
         for turn in 1..=self.max_turns {
             self.events.emit(AgentEvent::Turn { turn });
@@ -126,6 +169,7 @@ where
                         role: Role::Assistant,
                         content: message.clone(),
                     });
+                    self.store.save(&self.items)?;
                     self.events.emit(AgentEvent::Final {
                         message: message.clone(),
                         turn,
@@ -148,6 +192,7 @@ where
                         name: tool.clone(),
                         args: args.clone(),
                     });
+                    self.store.save(&self.items)?;
                     self.events.emit(AgentEvent::ToolStart {
                         tool: tool.clone(),
                         args: args.clone(),
@@ -164,6 +209,7 @@ where
                             reason: message.clone(),
                         });
                         self.push_tool_result(&id, &message);
+                        self.store.save(&self.items)?;
                         continue;
                     }
 
@@ -176,6 +222,7 @@ where
                         result: result.clone(),
                     });
                     self.push_tool_result(&id, &result);
+                    self.store.save(&self.items)?;
                 }
             }
         }
