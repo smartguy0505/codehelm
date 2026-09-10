@@ -2,7 +2,28 @@
 
 CodeHelm is a provider-neutral, safety-first coding agent that runs in your terminal. It combines useful patterns from modern agent CLIs: plan/build/review modes, explicit permissions, Git-aware tools, project instructions, resumable sessions, local-model support, and machine-readable output.
 
-This repository is an MVP. Its small, dependency-free core is intentionally easy to audit and extend.
+This repository is migrating from its dependency-free JavaScript MVP to a production-oriented Rust implementation. The JavaScript agent remains usable while Rust components reach feature parity.
+
+## Rust migration
+
+The Rust workspace currently provides:
+
+- A typed CLI surface for chat, plan, build, review, exec, resume, init, and config
+- Layered global, project, and command-line configuration
+- Provider and operating-mode types
+- Sensitive-path policies and command risk classification
+- Canonical workspace containment with symlink escape protection
+- A stable, serializable agent action and event protocol
+
+Build and inspect the Rust CLI:
+
+```bash
+cargo build --release
+./target/release/codehelm --help
+./target/release/codehelm config
+```
+
+Live agent execution still uses the JavaScript CLI during this migration. The next Rust slice will add asynchronous provider streaming and the agent loop.
 
 ## Features
 
@@ -80,6 +101,9 @@ Project configuration lives in `.codehelm/config.json`. Global defaults can be p
 ## Architecture
 
 ```text
+crates/codehelm-cli/       Rust command-line frontend
+crates/codehelm-core/      Rust configuration and security policy
+crates/codehelm-protocol/  Rust agent actions and event messages
 bin/codehelm.js          executable entry point
 src/cli.js           commands, interactive UX, approvals
 src/agent.js         provider-neutral tool-use loop
@@ -95,6 +119,9 @@ The agent uses a provider-neutral JSON action protocol, keeping the execution en
 ## Development
 
 ```bash
+cargo fmt --all -- --check
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
 npm test
 npm run check
 node ./bin/codehelm.js --help

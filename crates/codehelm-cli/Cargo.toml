@@ -1,0 +1,18 @@
+[package]
+name = "codehelm-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "codehelm"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+codehelm-core = { path = "../codehelm-core" }
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

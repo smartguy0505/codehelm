@@ -1,4 +1,5 @@
 .sagi/sessions/
 node_modules/
 coverage/
+target/
 *.log
