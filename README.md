@@ -21,6 +21,7 @@ The Rust workspace currently provides:
 - Multiple tool calls per model turn with deterministic authorization and execution
 - Workspace-contained Rust tools for listing, reading, and regex search
 - Fixed-argument read-only Git status and diff tools in every operating mode
+- MCP stdio servers with lifecycle negotiation, paginated discovery, and namespaced tools
 
 Build and inspect the Rust CLI:
 
@@ -98,6 +99,8 @@ cargo run --release -p codehelm-cli -- build --provider ollama --model qwen3-cod
 
 For OpenAI-compatible gateways, set `provider` to `openai-compatible`, provide `baseUrl` in `.codehelm/config.json`, and set `CODEHELM_API_KEY`.
 
+Configure MCP stdio servers under `mcpServers`. CodeHelm negotiates the stable `2025-11-25` lifecycle, exposes tools as `mcp__<server>__<tool>`, bounds every message and request, and asks for approval before each MCP call. Server commands are launched directly without a shell.
+
 ## Commands
 
 ```text
@@ -132,6 +135,14 @@ Merged configuration is validated before execution. Invalid URLs, permission glo
   "providerRetryBaseMs": 500,
   "providerTimeoutMs": 300000,
   "maxTotalTokens": 100000,
+  "mcpServers": {
+    "example": {
+      "command": "example-mcp-server",
+      "args": [],
+      "env": {},
+      "timeoutMs": 60000
+    }
+  },
   "permissions": {
     "allowCommands": ["git status", "git diff", "npm test"],
     "denyCommands": ["rm", "sudo", "git reset --hard"],
@@ -176,7 +187,7 @@ node ./bin/codehelm.js --help
 - OS-level command sandboxing and explicit interactive approvals
 - Patch-based edits with visual diff approval
 - Git worktree checkpoints and rollback
-- MCP client and plugin/skill system
+- Plugin and skill system
 - ACP server for editor integration
 - Parallel subagents with isolated worktrees
 - Tree-sitter/LSP context ranking

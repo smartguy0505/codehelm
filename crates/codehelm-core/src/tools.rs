@@ -13,6 +13,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use crate::{
     agent::{AgentError, ApprovalHandler, ToolExecutor},
     checkpoint::Checkpoint,
+    mcp::McpManager,
     permissions::{Decision, PermissionPolicy, resolve_inside},
 };
 
@@ -23,6 +24,7 @@ pub struct WorkspaceTools {
     writable: bool,
     checkpoint: Option<Checkpoint>,
     command_timeout_ms: Option<u64>,
+    mcp: Option<McpManager>,
 }
 
 impl WorkspaceTools {
@@ -39,6 +41,7 @@ impl WorkspaceTools {
             writable: false,
             checkpoint: None,
             command_timeout_ms: None,
+            mcp: None,
         })
     }
 
@@ -50,6 +53,11 @@ impl WorkspaceTools {
 
     pub fn enable_commands(mut self, timeout_ms: u64) -> Self {
         self.command_timeout_ms = Some(timeout_ms);
+        self
+    }
+
+    pub fn with_mcp(mut self, mcp: McpManager) -> Self {
+        self.mcp = Some(mcp);
         self
     }
 
@@ -623,6 +631,9 @@ impl ToolExecutor for WorkspaceTools {
         if self.command_timeout_ms.is_some() {
             specs.push(spec("run_command", "Run one policy-approved command without a shell", json!({"type":"object","properties":{"command":{"type":"string"}},"required":["command"],"additionalProperties":false})));
         }
+        if let Some(mcp) = &self.mcp {
+            specs.extend_from_slice(mcp.specs());
+        }
         specs
     }
 
@@ -631,6 +642,14 @@ impl ToolExecutor for WorkspaceTools {
     }
 
     async fn execute(&mut self, tool: &str, args: &Value) -> Result<String, AgentError> {
+        if self.mcp.as_ref().is_some_and(|mcp| mcp.contains(tool)) {
+            return self
+                .mcp
+                .as_mut()
+                .expect("MCP route exists")
+                .call(tool, args)
+                .await;
+        }
         match tool {
             "list_files" => self.list_files(args),
             "read_file" => self.read_file(args),
@@ -687,6 +706,7 @@ impl<F> PolicyApproval<F> {
             "run_command" => args["command"].as_str().map_or(Decision::Deny, |command| {
                 self.policy.command_decision(command)
             }),
+            tool if tool.starts_with("mcp__") => Decision::Ask,
             _ => Decision::Deny,
         }
     }
@@ -697,6 +717,7 @@ impl<F> PolicyApproval<F> {
             "write_file" | "replace_in_file" => {
                 format!("{tool} `{}`", args["path"].as_str().unwrap_or("?"))
             }
+            tool if tool.starts_with("mcp__") => format!("call MCP tool `{tool}`"),
             _ => tool.to_owned(),
         }
     }
@@ -1075,5 +1096,6 @@ mod tests {
             !yes.approve("run_command", &json!({"command":"sudo reboot"}), None)
                 .await
         );
+        assert!(yes.approve("mcp__server__tool", &json!({}), None).await);
     }
 }

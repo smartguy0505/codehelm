@@ -7,10 +7,10 @@ use std::{
 
 use clap::{Parser, Subcommand, ValueEnum};
 use codehelm_core::{
-    Agent, AnthropicProvider, ApprovalHandler, Config, ModelProvider, OllamaProvider,
-    OpenAiProvider, PolicyApproval, Provider, ReadOnlyApproval, RetryPolicy, SessionRecorder,
-    SessionStore, WorkspaceTools, config::ConfigOverrides, discover_workspace, list_checkpoints,
-    load_config, load_project_instructions, restore_checkpoint,
+    Agent, AnthropicProvider, ApprovalHandler, Config, McpManager, ModelProvider, OllamaProvider,
+    OpenAiProvider, PolicyApproval, Provider, RetryPolicy, SessionRecorder, SessionStore,
+    WorkspaceTools, config::ConfigOverrides, discover_workspace, list_checkpoints, load_config,
+    load_project_instructions, restore_checkpoint,
 };
 use codehelm_protocol::AgentEvent;
 use tracing_subscriber::EnvFilter;
@@ -281,22 +281,20 @@ async fn run_agent_with_session(
         config.permissions.clone(),
         config.max_tool_output_chars,
     )?;
+    if !config.mcp_servers.is_empty() {
+        tools = tools.with_mcp(McpManager::connect(&config.mcp_servers, root).await?);
+    }
     let writable = mode == "build";
     if writable {
         tools = tools
             .enable_edits()
             .enable_commands(config.command_timeout_ms);
     }
-    let approvals: Box<dyn ApprovalHandler> = if writable {
-        let policy = config.permissions.clone();
-        Box::new(PolicyApproval::new(
-            policy,
-            assume_yes,
-            move |description: &str| prompt_approval(description, !json),
-        ))
-    } else {
-        Box::new(ReadOnlyApproval)
-    };
+    let approvals: Box<dyn ApprovalHandler> = Box::new(PolicyApproval::new(
+        config.permissions.clone(),
+        assume_yes,
+        move |description: &str| prompt_approval(description, !json),
+    ));
     let instructions = load_project_instructions(root, cwd, config.max_instruction_chars)?;
     let working_directory = cwd.strip_prefix(root).unwrap_or(cwd).display();
     let system = format!(

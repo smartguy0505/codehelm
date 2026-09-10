@@ -2,6 +2,7 @@ pub mod agent;
 pub mod checkpoint;
 pub mod config;
 pub mod context;
+pub mod mcp;
 pub mod permissions;
 pub mod providers;
 pub mod tools;
@@ -12,7 +13,8 @@ pub use agent::{
 };
 pub mod session;
 pub use checkpoint::{list_checkpoints, restore_checkpoint};
-pub use config::{Config, ConfigError, Mode, Provider, load_config};
+pub use config::{Config, ConfigError, McpServerConfig, Mode, Provider, load_config};
+pub use mcp::McpManager;
 pub use permissions::{Decision, PermissionError, PermissionPolicy, resolve_inside};
 pub use providers::{AnthropicProvider, OllamaProvider, OpenAiProvider, RetryPolicy};
 pub use session::{Session, SessionRecorder, SessionStore};

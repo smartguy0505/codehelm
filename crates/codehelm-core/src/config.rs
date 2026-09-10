@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     env, fs,
     path::{Path, PathBuf},
 };
@@ -51,6 +52,7 @@ pub struct Config {
     pub provider_retry_base_ms: u64,
     pub provider_timeout_ms: u64,
     pub max_total_tokens: Option<u64>,
+    pub mcp_servers: BTreeMap<String, McpServerConfig>,
     pub permissions: crate::permissions::PermissionPolicy,
 }
 
@@ -69,7 +71,28 @@ impl Default for Config {
             provider_retry_base_ms: 500,
             provider_timeout_ms: 300_000,
             max_total_tokens: None,
+            mcp_servers: BTreeMap::new(),
             permissions: Default::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct McpServerConfig {
+    pub command: String,
+    pub args: Vec<String>,
+    pub env: BTreeMap<String, String>,
+    pub timeout_ms: u64,
+}
+
+impl Default for McpServerConfig {
+    fn default() -> Self {
+        Self {
+            command: String::new(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            timeout_ms: 60_000,
         }
     }
 }
@@ -183,8 +206,43 @@ impl Config {
         self.permissions
             .validate()
             .map_err(|error| ConfigError::Validation(error.to_string()))?;
+        for (name, server) in &self.mcp_servers {
+            if !valid_mcp_name(name) {
+                return Err(ConfigError::Validation(format!(
+                    "MCP server name `{name}` must contain only letters, digits, underscores, or hyphens"
+                )));
+            }
+            if server.command.trim().is_empty() {
+                return Err(ConfigError::Validation(format!(
+                    "MCP server `{name}` command must not be empty"
+                )));
+            }
+            validate_range(
+                &format!("mcpServers.{name}.timeoutMs"),
+                server.timeout_ms,
+                1,
+                86_400_000,
+            )?;
+            if server.env.keys().any(|key| {
+                key.is_empty()
+                    || !key
+                        .chars()
+                        .all(|character| character == '_' || character.is_ascii_alphanumeric())
+            }) {
+                return Err(ConfigError::Validation(format!(
+                    "MCP server `{name}` contains an invalid environment variable name"
+                )));
+            }
+        }
         Ok(())
     }
+}
+
+fn valid_mcp_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().all(|character| {
+            character == '_' || character == '-' || character.is_ascii_alphanumeric()
+        })
 }
 
 fn validate_range(name: &str, value: u64, min: u64, max: u64) -> Result<(), ConfigError> {
@@ -295,5 +353,23 @@ mod tests {
         assert!(config.validate().is_err());
         config.base_url = Some("http://127.0.0.1:11434".into());
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn validates_mcp_process_configuration() {
+        let mut config = Config::default();
+        config.mcp_servers.insert(
+            "bad name".into(),
+            McpServerConfig {
+                command: "server".into(),
+                ..McpServerConfig::default()
+            },
+        );
+        assert!(config.validate().is_err());
+        config.mcp_servers.clear();
+        config
+            .mcp_servers
+            .insert("valid-server".into(), McpServerConfig::default());
+        assert!(config.validate().is_err());
     }
 }
