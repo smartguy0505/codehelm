@@ -45,6 +45,7 @@ pub struct Config {
     pub max_turns: usize,
     pub command_timeout_ms: u64,
     pub max_tool_output_chars: usize,
+    pub max_instruction_chars: usize,
     pub permissions: crate::permissions::PermissionPolicy,
 }
 
@@ -57,6 +58,7 @@ impl Default for Config {
             max_turns: 20,
             command_timeout_ms: 120_000,
             max_tool_output_chars: 30_000,
+            max_instruction_chars: 100_000,
             permissions: Default::default(),
         }
     }

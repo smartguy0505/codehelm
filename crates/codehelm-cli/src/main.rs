@@ -9,7 +9,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use codehelm_core::{
     Agent, AnthropicProvider, ApprovalHandler, Config, ModelProvider, OllamaProvider,
     OpenAiProvider, PolicyApproval, Provider, ReadOnlyApproval, SessionRecorder, SessionStore,
-    WorkspaceTools, config::ConfigOverrides, list_checkpoints, load_config, restore_checkpoint,
+    WorkspaceTools, config::ConfigOverrides, discover_workspace, list_checkpoints, load_config,
+    load_project_instructions, restore_checkpoint,
 };
 use codehelm_protocol::AgentEvent;
 use tracing_subscriber::EnvFilter;
@@ -100,7 +101,7 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
-    let cwd = std::env::current_dir()?;
+    let cwd = fs::canonicalize(std::env::current_dir()?)?;
     if matches!(cli.command, Some(Command::Init)) {
         initialize(&cwd)?;
         println!(
@@ -109,9 +110,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         );
         return Ok(());
     }
+    let root = discover_workspace(&cwd)?;
 
     let config = load_config(
-        &cwd,
+        &root,
         ConfigOverrides {
             provider: cli.provider.map(Into::into),
             model: cli.model,
@@ -122,7 +124,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command.unwrap_or(Command::Chat) {
         Command::Config => println!("{}", serde_json::to_string_pretty(&config)?),
         Command::Checkpoints => {
-            let checkpoints = list_checkpoints(&cwd)?;
+            let checkpoints = list_checkpoints(&root)?;
             if checkpoints.is_empty() {
                 println!("No recoverable checkpoints.");
             } else {
@@ -131,39 +133,50 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::Rollback { checkpoint } => {
             let id = if checkpoint == "latest" {
-                list_checkpoints(&cwd)?
+                list_checkpoints(&root)?
                     .into_iter()
                     .next()
                     .ok_or("no recoverable checkpoints")?
             } else {
                 checkpoint
             };
-            let count = restore_checkpoint(&cwd, &id, &config.permissions)?;
+            let count = restore_checkpoint(&root, &id, &config.permissions)?;
             println!("Restored {count} file(s) from checkpoint {id}.");
         }
         Command::Plan { task } => {
-            run_agent(&cwd, &config, &task, "plan", cli.json, cli.yes).await?
+            run_agent(&root, &cwd, &config, &task, "plan", cli.json, cli.yes).await?
         }
         Command::Exec { task } => {
-            run_agent(&cwd, &config, &task, "exec", cli.json, cli.yes).await?
+            run_agent(&root, &cwd, &config, &task, "exec", cli.json, cli.yes).await?
         }
         Command::Build { task } => {
-            run_agent(&cwd, &config, &task, "build", cli.json, cli.yes).await?
+            run_agent(&root, &cwd, &config, &task, "build", cli.json, cli.yes).await?
         }
         Command::Resume { session, task } => {
-            let store = SessionStore::load(&cwd, session.as_deref().unwrap_or("latest"))?;
+            let store = SessionStore::load(&root, session.as_deref().unwrap_or("latest"))?;
             let mode = store.session().mode.clone();
             let task =
                 task.unwrap_or_else(|| "Continue the previous task from the saved context.".into());
-            run_agent_with_session(&cwd, &config, &task, &mode, cli.json, cli.yes, Some(store))
-                .await?;
+            run_agent_with_session(
+                &root,
+                &cwd,
+                &config,
+                &task,
+                &mode,
+                RunOptions {
+                    json: cli.json,
+                    assume_yes: cli.yes,
+                },
+                Some(store),
+            )
+            .await?;
         }
         Command::Review { focus } => {
             let task = focus.map_or_else(
                 || "Review the current repository changes.".into(),
                 |focus| format!("Review the current repository changes, focusing on {focus}."),
             );
-            run_agent(&cwd, &config, &task, "review", cli.json, cli.yes).await?;
+            run_agent(&root, &cwd, &config, &task, "review", cli.json, cli.yes).await?;
         }
         command => print_migration_status(command, &config, cli.json),
     }
@@ -171,6 +184,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run_agent(
+    root: &Path,
     cwd: &Path,
     config: &Config,
     task: &str,
@@ -178,18 +192,34 @@ async fn run_agent(
     json: bool,
     assume_yes: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    run_agent_with_session(cwd, config, task, mode, json, assume_yes, None).await
+    run_agent_with_session(
+        root,
+        cwd,
+        config,
+        task,
+        mode,
+        RunOptions { json, assume_yes },
+        None,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+struct RunOptions {
+    json: bool,
+    assume_yes: bool,
 }
 
 async fn run_agent_with_session(
+    root: &Path,
     cwd: &Path,
     config: &Config,
     task: &str,
     mode: &str,
-    json: bool,
-    assume_yes: bool,
+    options: RunOptions,
     saved: Option<SessionStore>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let RunOptions { json, assume_yes } = options;
     let provider: Box<dyn ModelProvider> = match config.provider {
         Provider::Openai | Provider::OpenaiCompatible => {
             let key = api_key("OPENAI_API_KEY")?;
@@ -223,7 +253,7 @@ async fn run_agent_with_session(
         }
     };
     let mut tools = WorkspaceTools::new(
-        cwd,
+        root,
         config.permissions.clone(),
         config.max_tool_output_chars,
     )?;
@@ -243,14 +273,15 @@ async fn run_agent_with_session(
     } else {
         Box::new(ReadOnlyApproval)
     };
-    let instructions = project_instructions(cwd)?;
+    let instructions = load_project_instructions(root, cwd, config.max_instruction_chars)?;
+    let working_directory = cwd.strip_prefix(root).unwrap_or(cwd).display();
     let system = format!(
-        "You are CodeHelm, a careful coding agent. Mode: {mode}. Inspect before editing, make focused changes, and verify your work. The rollback_edits tool can restore every file changed during this run. Never invent tool results.\n\nProject instructions:\n{instructions}"
+        "You are CodeHelm, a careful coding agent. Mode: {mode}. Workspace paths are relative to the project root. Invocation directory: {working_directory}. Inspect before editing, make focused changes, and verify your work. The rollback_edits tool can restore every file changed during this run. Never invent tool results.\n\nProject instructions:\n{instructions}"
     );
     let resumed = saved.is_some();
     let store = match saved {
         Some(store) => store,
-        None => SessionStore::create(cwd, mode, config.provider.to_string(), &config.model)?,
+        None => SessionStore::create(root, mode, config.provider.to_string(), &config.model)?,
     };
     let recorder = SessionRecorder::new(store);
     let session_event = AgentEvent::SessionStarted {
@@ -300,22 +331,6 @@ fn api_key(provider_variable: &str) -> Result<String, Box<dyn std::error::Error>
     env::var("CODEHELM_API_KEY")
         .or_else(|_| env::var(provider_variable))
         .map_err(|_| format!("set {provider_variable} or CODEHELM_API_KEY").into())
-}
-
-fn project_instructions(cwd: &Path) -> io::Result<String> {
-    let mut sections = Vec::new();
-    for name in ["AGENTS.md", "CLAUDE.md"] {
-        match fs::read_to_string(cwd.join(name)) {
-            Ok(content) => sections.push(format!("## {name}\n{content}")),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(if sections.is_empty() {
-        "(none)".into()
-    } else {
-        sections.join("\n\n")
-    })
 }
 
 fn render_event(event: AgentEvent, json: bool) {

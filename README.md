@@ -40,6 +40,8 @@ Every Rust build stores original file contents under `.codehelm/checkpoints` bef
 
 Rust sessions are atomically persisted under `.codehelm/sessions` after every conversation transition, with an append-only NDJSON event journal. Continue the latest run with `codehelm resume latest "continue with the failing test"`.
 
+When launched from a nested directory, the Rust CLI discovers the nearest CodeHelm or Git project root. It loads `AGENTS.md` and `CLAUDE.md` files from the root down to the invocation directory, with deeper instructions applied later and a configurable `maxInstructionChars` context limit.
+
 ## Features
 
 - OpenAI, Anthropic, Ollama, and OpenAI-compatible providers
@@ -107,6 +109,7 @@ Project configuration lives in `.codehelm/config.json`. Global defaults can be p
   "provider": "openai",
   "model": "gpt-5-mini",
   "maxTurns": 20,
+  "maxInstructionChars": 100000,
   "permissions": {
     "allowCommands": ["git status", "git diff", "npm test"],
     "denyCommands": ["rm", "sudo", "git reset --hard"],
