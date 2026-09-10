@@ -1,0 +1,113 @@
+# CodeHelm Agent CLI
+
+CodeHelm is a provider-neutral, safety-first coding agent that runs in your terminal. It combines useful patterns from modern agent CLIs: plan/build/review modes, explicit permissions, Git-aware tools, project instructions, resumable sessions, local-model support, and machine-readable output.
+
+This repository is an MVP. Its small, dependency-free core is intentionally easy to audit and extend.
+
+## Features
+
+- OpenAI, Anthropic, Ollama, and OpenAI-compatible providers
+- Interactive terminal sessions and non-interactive execution
+- Read-only `plan` and `review` modes
+- Workspace-contained file access, including symlink escape protection
+- Sensitive-file and dangerous-command deny rules
+- Read, search, focused replacement, file creation, shell, and Git tools
+- `AGENTS.md` and `CLAUDE.md` project instructions
+- Persistent sessions under `.codehelm/sessions`
+- NDJSON events for scripts and CI
+- Zero runtime dependencies; Node.js 20+
+
+## Quick start
+
+```bash
+cd codehelm
+npm link
+cd /path/to/your/project
+codehelm init
+export OPENAI_API_KEY="your-key"
+codehelm plan "add passwordless authentication"
+codehelm build "implement the approved authentication plan"
+codehelm review
+```
+
+For Anthropic:
+
+```bash
+export ANTHROPIC_API_KEY="your-key"
+codehelm build --provider anthropic --model claude-sonnet-4-6 "fix the failing tests"
+```
+
+For a local Ollama model:
+
+```bash
+codehelm build --provider ollama --model qwen3-coder "explain and improve this project"
+```
+
+For OpenAI-compatible gateways, set `provider` to `openai-compatible`, provide `baseUrl` in `.codehelm/config.json`, and set `CODEHELM_API_KEY`.
+
+## Commands
+
+```text
+codehelm                         interactive build session
+codehelm plan "task"             read-only investigation
+codehelm build "task"            implement, test, and review
+codehelm review                  inspect current Git changes
+codehelm exec "task" --json      headless execution with NDJSON events
+codehelm resume latest           continue the latest session
+codehelm init                    create project configuration
+```
+
+Shell commands outside the configured allowlist require confirmation. In non-interactive environments they are denied unless `--yes` is supplied. Denylisted commands are always blocked.
+
+## Configuration
+
+Project configuration lives in `.codehelm/config.json`. Global defaults can be placed in `~/.config/codehelm/config.json`. Project values override global values, and CLI flags override both.
+
+```json
+{
+  "provider": "openai",
+  "model": "gpt-5-mini",
+  "maxTurns": 20,
+  "permissions": {
+    "allowCommands": ["git status", "git diff", "npm test"],
+    "denyCommands": ["rm", "sudo", "git reset --hard"],
+    "denyRead": [".env", ".env.*", "**/*.pem", "**/*.key"],
+    "denyWrite": [".git/**", ".env", "**/*.key"]
+  }
+}
+```
+
+## Architecture
+
+```text
+bin/codehelm.js          executable entry point
+src/cli.js           commands, interactive UX, approvals
+src/agent.js         provider-neutral tool-use loop
+src/providers.js     model provider adapters
+src/tools.js         repository, editing, shell, and Git tools
+src/permissions.js   path containment and policy decisions
+src/session.js       resumable local session storage
+src/config.js        layered project/global configuration
+```
+
+The agent uses a provider-neutral JSON action protocol, keeping the execution engine independent of any vendor-specific tool-calling format.
+
+## Development
+
+```bash
+npm test
+npm run check
+node ./bin/codehelm.js --help
+```
+
+## Roadmap
+
+- Native provider tool-calling and streaming
+- Patch-based edits with visual diff approval
+- Git worktree checkpoints and rollback
+- MCP client and plugin/skill system
+- ACP server for editor integration
+- Parallel subagents with isolated worktrees
+- Tree-sitter/LSP context ranking
+- Token and cost budgets
+- OS-level sandbox adapters

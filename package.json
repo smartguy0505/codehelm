@@ -1,0 +1,18 @@
+{
+  "name": "codehelm",
+  "version": "0.1.0",
+  "description": "A provider-neutral, safety-first agentic coding CLI for planning, autonomous execution, Git-aware development, and resumable workflows",
+  "type": "module",
+  "bin": {
+    "codehelm": "./bin/codehelm.js"
+  },
+  "scripts": {
+    "start": "node ./bin/codehelm.js",
+    "test": "node --test",
+    "check": "node --check ./bin/codehelm.js && node --check ./src/agent.js && node --check ./src/tools.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}

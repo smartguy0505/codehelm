@@ -1,0 +1,4 @@
+.sagi/sessions/
+node_modules/
+coverage/
+*.log
