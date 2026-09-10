@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -12,6 +11,7 @@ use serde_json::{Value, json};
 
 use crate::{
     agent::{AgentError, ApprovalHandler, ToolExecutor},
+    checkpoint::Checkpoint,
     permissions::{Decision, PermissionPolicy, resolve_inside},
 };
 
@@ -20,7 +20,7 @@ pub struct WorkspaceTools {
     policy: PermissionPolicy,
     max_output_chars: usize,
     writable: bool,
-    snapshots: HashMap<PathBuf, Option<Vec<u8>>>,
+    checkpoint: Option<Checkpoint>,
     command_timeout_ms: Option<u64>,
 }
 
@@ -36,13 +36,14 @@ impl WorkspaceTools {
             policy,
             max_output_chars,
             writable: false,
-            snapshots: HashMap::new(),
+            checkpoint: None,
             command_timeout_ms: None,
         })
     }
 
     pub fn enable_edits(mut self) -> Self {
         self.writable = true;
+        self.checkpoint = Some(Checkpoint::new(&self.root));
         self
     }
 
@@ -232,20 +233,18 @@ impl WorkspaceTools {
         }
         let target =
             resolve_inside(&self.root, &relative).map_err(|error| tool_error("path", error))?;
-        if !self.snapshots.contains_key(&relative) {
-            let original = match fs::read(&target) {
-                Ok(data) => Some(data),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                Err(error) => return Err(tool_error("snapshot", error)),
-            };
-            self.snapshots.insert(relative.clone(), original);
-        }
+        let checkpoint = self
+            .checkpoint
+            .as_mut()
+            .ok_or_else(|| tool_error("checkpoint", "editing checkpoint is unavailable"))?;
+        checkpoint.capture(&relative, &target)?;
+        let checkpoint_id = checkpoint.id().to_owned();
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent).map_err(|error| tool_error("write_file", error))?;
         }
         atomic_write(&target, content)?;
         Ok(format!(
-            "Wrote {} ({} bytes)",
+            "Wrote {} ({} bytes; checkpoint {checkpoint_id})",
             normalize(&relative),
             content.len()
         ))
@@ -274,20 +273,12 @@ impl WorkspaceTools {
     }
 
     fn rollback(&mut self) -> Result<String, AgentError> {
-        let snapshots = std::mem::take(&mut self.snapshots);
-        let count = snapshots.len();
-        for (relative, original) in snapshots {
-            let target = resolve_inside(&self.root, &relative)
-                .map_err(|error| tool_error("rollback", error))?;
-            match original {
-                Some(data) => atomic_write(&target, &data)?,
-                None => match fs::remove_file(target) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(tool_error("rollback", error)),
-                },
-            }
-        }
+        let checkpoint = self
+            .checkpoint
+            .take()
+            .ok_or_else(|| tool_error("rollback", "editing checkpoint is unavailable"))?;
+        let count = checkpoint.restore(&self.policy)?;
+        self.checkpoint = Some(Checkpoint::new(&self.root));
         Ok(format!("Rolled back {count} file(s)"))
     }
 

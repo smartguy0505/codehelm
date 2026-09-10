@@ -33,6 +33,8 @@ The Rust CLI supports live `plan`, `review`, `exec`, and transactional `build` r
 
 Rust build mode can also run configured allowlisted commands directly, without invoking a shell. Commands are bounded by configured timeout and output limits; OS-level filesystem and network isolation remains on the roadmap.
 
+Every Rust build stores original file contents under `.codehelm/checkpoints` before the first write. Interrupted runs can be recovered with `codehelm checkpoints` and `codehelm rollback latest`.
+
 ## Features
 
 - OpenAI, Anthropic, Ollama, and OpenAI-compatible providers
@@ -81,6 +83,8 @@ codehelm                         interactive build session
 codehelm plan "task"             read-only investigation
 codehelm build "task"            implement, test, and review
 codehelm review                  inspect current Git changes
+codehelm checkpoints             list recoverable edit checkpoints
+codehelm rollback latest         restore an interrupted build
 codehelm exec "task" --json      headless execution with NDJSON events
 codehelm resume latest           continue the latest session
 codehelm init                    create project configuration

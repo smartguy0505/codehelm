@@ -9,7 +9,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use codehelm_core::{
     Agent, AnthropicProvider, ApprovalHandler, BuildApproval, Config, ModelProvider,
     OpenAiProvider, Provider, ReadOnlyApproval, WorkspaceTools, config::ConfigOverrides,
-    load_config,
+    list_checkpoints, load_config, restore_checkpoint,
 };
 use codehelm_protocol::AgentEvent;
 use tracing_subscriber::EnvFilter;
@@ -62,6 +62,8 @@ enum Command {
     Review { focus: Option<String> },
     Exec { task: String },
     Resume { session: Option<String> },
+    Checkpoints,
+    Rollback { checkpoint: String },
     Init,
     Config,
 }
@@ -106,6 +108,26 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command.unwrap_or(Command::Chat) {
         Command::Config => println!("{}", serde_json::to_string_pretty(&config)?),
+        Command::Checkpoints => {
+            let checkpoints = list_checkpoints(&cwd)?;
+            if checkpoints.is_empty() {
+                println!("No recoverable checkpoints.");
+            } else {
+                println!("{}", checkpoints.join("\n"));
+            }
+        }
+        Command::Rollback { checkpoint } => {
+            let id = if checkpoint == "latest" {
+                list_checkpoints(&cwd)?
+                    .into_iter()
+                    .next()
+                    .ok_or("no recoverable checkpoints")?
+            } else {
+                checkpoint
+            };
+            let count = restore_checkpoint(&cwd, &id, &config.permissions)?;
+            println!("Restored {count} file(s) from checkpoint {id}.");
+        }
         Command::Plan { task } => run_agent(&cwd, &config, &task, "plan", cli.json).await?,
         Command::Exec { task } => run_agent(&cwd, &config, &task, "exec", cli.json).await?,
         Command::Build { task } => run_agent(&cwd, &config, &task, "build", cli.json).await?,
@@ -264,7 +286,9 @@ fn print_migration_status(command: Command, config: &Config, json: bool) {
         Command::Review { .. } => "review",
         Command::Exec { .. } => "exec",
         Command::Resume { .. } => "resume",
-        Command::Init | Command::Config => unreachable!(),
+        Command::Init | Command::Config | Command::Checkpoints | Command::Rollback { .. } => {
+            unreachable!()
+        }
     };
     if json {
         println!(
