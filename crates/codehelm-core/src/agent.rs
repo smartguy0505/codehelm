@@ -50,6 +50,10 @@ impl<T: ModelProvider + ?Sized> ModelProvider for Box<T> {
 pub trait ToolExecutor {
     fn specs(&self) -> Vec<ToolSpec>;
 
+    fn preview(&self, _tool: &str, _args: &Value) -> Result<Option<String>, AgentError> {
+        Ok(None)
+    }
+
     async fn execute(&mut self, tool: &str, args: &Value) -> Result<String, AgentError>;
 }
 
@@ -272,6 +276,23 @@ where
                             args: args.clone(),
                             reason: reason.clone(),
                         });
+                        match self.tools.preview(&tool, &args) {
+                            Ok(Some(preview)) => self.events.emit(AgentEvent::ToolPreview {
+                                tool: tool.clone(),
+                                preview,
+                            }),
+                            Ok(None) => {}
+                            Err(error) => {
+                                let result = format!("Tool error: {error}");
+                                self.events.emit(AgentEvent::ToolResult {
+                                    tool,
+                                    result: result.clone(),
+                                });
+                                self.push_tool_result(&id, &result);
+                                self.store.save(&self.items)?;
+                                continue;
+                            }
+                        }
                         if !self
                             .approvals
                             .approve(&tool, &args, reason.as_deref())

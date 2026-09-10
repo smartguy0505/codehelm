@@ -399,6 +399,7 @@ fn render_event(event: AgentEvent, json: bool) {
                 eprintln!("→ {tool}");
             }
         }
+        AgentEvent::ToolPreview { preview, .. } => eprintln!("{preview}"),
         AgentEvent::ToolDenied { tool, reason } => eprintln!("denied {tool}: {reason}"),
         _ => {}
     }

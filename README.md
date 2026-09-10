@@ -36,6 +36,8 @@ Rust build mode can also run configured allowlisted commands directly, without i
 
 Commands outside `allowCommands` require an interactive confirmation. Headless runs deny these ask-level actions unless `--yes` is supplied; denylisted commands and protected paths remain blocked even with `--yes`. Paths matching optional `permissions.askWrite` patterns use the same approval flow.
 
+Proposed file writes and exact replacements produce a bounded unified diff before approval and execution. Preview validation is read-only, respects sensitive-path policy, and catches stale replacement targets before prompting.
+
 Every Rust build stores original file contents under `.codehelm/checkpoints` before the first write. Interrupted runs can be recovered with `codehelm checkpoints` and `codehelm rollback latest`.
 
 Rust sessions are atomically persisted under `.codehelm/sessions` after every conversation transition, with an append-only NDJSON event journal. Continue the latest run with `codehelm resume latest "continue with the failing test"`.

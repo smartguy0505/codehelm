@@ -256,6 +256,61 @@ impl WorkspaceTools {
         self.write_path(&path, &content)
     }
 
+    fn edit_preview(&self, tool: &str, args: &Value) -> Result<Option<String>, AgentError> {
+        let (path, proposed) = match tool {
+            "write_file" => (
+                required_arg(args, "path")?.to_owned(),
+                required_arg(args, "content")?.to_owned(),
+            ),
+            "replace_in_file" => {
+                let path = required_arg(args, "path")?.to_owned();
+                let old = required_arg(args, "oldText")?;
+                let new = required_arg(args, "newText")?;
+                let (_, target) = self.relative(&path)?;
+                let content = fs::read_to_string(target)
+                    .map_err(|error| tool_error("replace_in_file", error))?;
+                if content.matches(old).count() != 1 {
+                    return Err(tool_error(
+                        "replace_in_file",
+                        "oldText must occur exactly once",
+                    ));
+                }
+                (path, content.replacen(old, new, 1))
+            }
+            _ => return Ok(None),
+        };
+        let relative = PathBuf::from(&path);
+        if self
+            .policy
+            .write_decision(&relative)
+            .map_err(|error| tool_error("permission", error))?
+            == Decision::Deny
+        {
+            return Err(tool_error("permission", format!("write denied: {path}")));
+        }
+        let target =
+            resolve_inside(&self.root, &relative).map_err(|error| tool_error("path", error))?;
+        let current = if target.exists() {
+            if self
+                .policy
+                .read_decision(&relative)
+                .map_err(|error| tool_error("permission", error))?
+                == Decision::Deny
+            {
+                return Err(tool_error("permission", format!("read denied: {path}")));
+            }
+            fs::read_to_string(&target).map_err(|error| tool_error(tool, error))?
+        } else {
+            String::new()
+        };
+        if current == proposed {
+            return Ok(Some(format!("--- a/{path}\n+++ b/{path}\n(no changes)")));
+        }
+        Ok(Some(
+            self.truncate(unified_diff(&path, &current, &proposed)),
+        ))
+    }
+
     fn replace_in_file(&mut self, args: &Value) -> Result<String, AgentError> {
         let path = required_arg(args, "path")?.to_owned();
         let old = required_arg(args, "oldText")?;
@@ -366,6 +421,10 @@ impl ToolExecutor for WorkspaceTools {
             specs.push(spec("run_command", "Run one policy-approved command without a shell", json!({"type":"object","properties":{"command":{"type":"string"}},"required":["command"],"additionalProperties":false})));
         }
         specs
+    }
+
+    fn preview(&self, tool: &str, args: &Value) -> Result<Option<String>, AgentError> {
+        self.edit_preview(tool, args)
     }
 
     async fn execute(&mut self, tool: &str, args: &Value) -> Result<String, AgentError> {
@@ -492,6 +551,55 @@ fn atomic_write(target: &Path, content: &[u8]) -> Result<(), AgentError> {
     Ok(())
 }
 
+fn unified_diff(path: &str, old: &str, new: &str) -> String {
+    let old_lines = old.lines().collect::<Vec<_>>();
+    let new_lines = new.lines().collect::<Vec<_>>();
+    let prefix = old_lines
+        .iter()
+        .zip(&new_lines)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let max_suffix = old_lines.len().min(new_lines.len()).saturating_sub(prefix);
+    let suffix = old_lines
+        .iter()
+        .rev()
+        .zip(new_lines.iter().rev())
+        .take(max_suffix)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let context_start = prefix.saturating_sub(3);
+    let old_end = old_lines
+        .len()
+        .saturating_sub(suffix)
+        .saturating_add(3)
+        .min(old_lines.len());
+    let new_end = new_lines
+        .len()
+        .saturating_sub(suffix)
+        .saturating_add(3)
+        .min(new_lines.len());
+    let mut diff = format!(
+        "--- a/{path}\n+++ b/{path}\n@@ -{},{} +{},{} @@\n",
+        context_start + 1,
+        old_end.saturating_sub(context_start),
+        context_start + 1,
+        new_end.saturating_sub(context_start)
+    );
+    for line in &old_lines[context_start..prefix] {
+        diff.push_str(&format!(" {line}\n"));
+    }
+    for line in &old_lines[prefix..old_lines.len().saturating_sub(suffix)] {
+        diff.push_str(&format!("-{line}\n"));
+    }
+    for line in &new_lines[prefix..new_lines.len().saturating_sub(suffix)] {
+        diff.push_str(&format!("+{line}\n"));
+    }
+    for line in &new_lines[new_lines.len().saturating_sub(suffix)..new_end] {
+        diff.push_str(&format!(" {line}\n"));
+    }
+    diff.trim_end().to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -569,6 +677,45 @@ mod tests {
                 .contains("needle")
         );
         assert!(!root.join("new.txt").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn edit_preview_is_unified_and_side_effect_free() {
+        let root = workspace();
+        let tools = WorkspaceTools::new(&root, PermissionPolicy::default(), 1_000)
+            .unwrap()
+            .enable_edits();
+        let preview = tools
+            .preview(
+                "replace_in_file",
+                &json!({"path":"src/lib.rs","oldText":"needle","newText":"changed"}),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(preview.starts_with("--- a/src/lib.rs\n+++ b/src/lib.rs\n@@"));
+        assert!(preview.contains("-needle\n+changed"));
+        assert_eq!(
+            fs::read_to_string(root.join("src/lib.rs")).unwrap(),
+            "first\nneedle\nthird\n"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn edit_preview_does_not_expose_sensitive_files() {
+        let root = workspace();
+        let tools = WorkspaceTools::new(&root, PermissionPolicy::default(), 1_000)
+            .unwrap()
+            .enable_edits();
+        let error = tools
+            .preview(
+                "write_file",
+                &json!({"path":".env","content":"replacement"}),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("write denied"));
+        assert!(!error.to_string().contains("SECRET=value"));
         fs::remove_dir_all(root).unwrap();
     }
 

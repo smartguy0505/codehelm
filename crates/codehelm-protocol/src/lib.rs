@@ -129,6 +129,10 @@ pub enum AgentEvent {
         args: Value,
         reason: Option<String>,
     },
+    ToolPreview {
+        tool: String,
+        preview: String,
+    },
     ToolResult {
         tool: String,
         result: String,
