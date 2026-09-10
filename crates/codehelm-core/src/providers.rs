@@ -1,5 +1,9 @@
+use std::collections::BTreeMap;
+
 use async_trait::async_trait;
-use codehelm_protocol::{AgentAction, AgentEvent, ConversationItem, ModelRequest, Role};
+use codehelm_protocol::{
+    AgentAction, AgentEvent, ConversationItem, ModelRequest, Role, ToolCallRequest,
+};
 use futures_util::StreamExt;
 use reqwest::{Client, Response};
 use serde_json::{Value, json};
@@ -56,7 +60,7 @@ impl ModelProvider for OpenAiProvider {
 #[derive(Default)]
 struct OpenAiState {
     text: String,
-    tool: Option<(String, String, Value)>,
+    tools: Vec<ToolCallRequest>,
 }
 
 impl OpenAiState {
@@ -77,7 +81,12 @@ impl OpenAiState {
                 let id = required_str(item, "call_id")?;
                 let name = required_str(item, "name")?;
                 let args = parse_args(item["arguments"].as_str().unwrap_or("{}"))?;
-                self.tool = Some((id, name, args));
+                self.tools.push(ToolCallRequest {
+                    id,
+                    tool: name,
+                    args,
+                    reason: None,
+                });
             }
             Some("error" | "response.failed") => {
                 return Err(AgentError::Provider(event.to_string()));
@@ -88,13 +97,8 @@ impl OpenAiState {
     }
 
     fn finish(self) -> Result<AgentAction, AgentError> {
-        if let Some((id, tool, args)) = self.tool {
-            Ok(AgentAction::Tool {
-                id,
-                tool,
-                args,
-                reason: None,
-            })
+        if !self.tools.is_empty() {
+            Ok(tool_action(self.tools))
         } else if self.text.is_empty() {
             Err(AgentError::Provider(
                 "OpenAI returned no text or tool call".into(),
@@ -206,17 +210,29 @@ impl ModelProvider for AnthropicProvider {
 #[derive(Default)]
 struct AnthropicState {
     text: String,
-    tool_id: Option<String>,
-    tool_name: Option<String>,
-    tool_args: String,
+    tools: BTreeMap<u64, AnthropicTool>,
+}
+
+#[derive(Default)]
+struct AnthropicTool {
+    id: String,
+    name: String,
+    args: String,
 }
 
 impl AnthropicState {
     fn consume(&mut self, event: Value, events: &mut dyn EventSink) -> Result<(), AgentError> {
         match event["type"].as_str() {
             Some("content_block_start") if event["content_block"]["type"] == "tool_use" => {
-                self.tool_id = event["content_block"]["id"].as_str().map(str::to_owned);
-                self.tool_name = event["content_block"]["name"].as_str().map(str::to_owned);
+                let index = event["index"].as_u64().unwrap_or(self.tools.len() as u64);
+                self.tools.insert(
+                    index,
+                    AnthropicTool {
+                        id: required_str(&event["content_block"], "id")?,
+                        name: required_str(&event["content_block"], "name")?,
+                        args: String::new(),
+                    },
+                );
             }
             Some("content_block_delta") => match event["delta"]["type"].as_str() {
                 Some("text_delta") => {
@@ -229,7 +245,13 @@ impl AnthropicState {
                 }
                 Some("input_json_delta") => {
                     if let Some(delta) = event["delta"]["partial_json"].as_str() {
-                        self.tool_args.push_str(delta);
+                        let index = event["index"].as_u64().unwrap_or(0);
+                        let tool = self.tools.get_mut(&index).ok_or_else(|| {
+                            AgentError::Provider(format!(
+                                "Anthropic sent arguments for unknown tool block {index}"
+                            ))
+                        })?;
+                        tool.args.push_str(delta);
                     }
                 }
                 _ => {}
@@ -241,21 +263,31 @@ impl AnthropicState {
     }
 
     fn finish(self) -> Result<AgentAction, AgentError> {
-        match (self.tool_id, self.tool_name) {
-            (Some(id), Some(tool)) => Ok(AgentAction::Tool {
-                id,
-                tool,
-                args: parse_args(if self.tool_args.is_empty() {
-                    "{}"
-                } else {
-                    &self.tool_args
-                })?,
-                reason: None,
-            }),
-            _ if !self.text.is_empty() => Ok(AgentAction::Final { message: self.text }),
-            _ => Err(AgentError::Provider(
+        if !self.tools.is_empty() {
+            let calls = self
+                .tools
+                .into_values()
+                .map(|tool| {
+                    let args = parse_args(if tool.args.is_empty() {
+                        "{}"
+                    } else {
+                        &tool.args
+                    })?;
+                    Ok(ToolCallRequest {
+                        id: tool.id,
+                        tool: tool.name,
+                        args,
+                        reason: None,
+                    })
+                })
+                .collect::<Result<Vec<_>, AgentError>>()?;
+            Ok(tool_action(calls))
+        } else if !self.text.is_empty() {
+            Ok(AgentAction::Final { message: self.text })
+        } else {
+            Err(AgentError::Provider(
                 "Anthropic returned no text or tool call".into(),
-            )),
+            ))
         }
     }
 }
@@ -359,7 +391,7 @@ impl ModelProvider for OllamaProvider {
 #[derive(Default)]
 struct OllamaState {
     text: String,
-    tool: Option<(String, String, Value)>,
+    tools: Vec<ToolCallRequest>,
     calls_seen: usize,
 }
 
@@ -386,22 +418,20 @@ impl OllamaState {
                     .as_u64()
                     .map_or(self.calls_seen, |value| value as usize);
                 self.calls_seen += 1;
-                if self.tool.is_none() {
-                    self.tool = Some((format!("ollama-{index}"), name, args));
-                }
+                self.tools.push(ToolCallRequest {
+                    id: format!("ollama-{index}"),
+                    tool: name,
+                    args,
+                    reason: None,
+                });
             }
         }
         Ok(())
     }
 
     fn finish(self) -> Result<AgentAction, AgentError> {
-        if let Some((id, tool, args)) = self.tool {
-            Ok(AgentAction::Tool {
-                id,
-                tool,
-                args,
-                reason: None,
-            })
+        if !self.tools.is_empty() {
+            Ok(tool_action(self.tools))
         } else if self.text.is_empty() {
             Err(AgentError::Provider(
                 "Ollama returned no text or tool call".into(),
@@ -413,18 +443,28 @@ impl OllamaState {
 }
 
 fn ollama_request(model: &str, request: &ModelRequest) -> Value {
-    let messages = request
-        .items
-        .iter()
-        .map(|item| match item {
-            ConversationItem::Message { role, content } => json!({
+    let mut messages: Vec<Value> = Vec::new();
+    for item in &request.items {
+        match item {
+            ConversationItem::Message { role, content } => messages.push(json!({
                 "role": role_name(*role), "content": content
-            }),
-            ConversationItem::ToolCall { name, args, .. } => json!({
-                "role": "assistant", "content": "", "tool_calls": [{
+            })),
+            ConversationItem::ToolCall { name, args, .. } => {
+                let call = json!({
                     "type": "function", "function": {"name": name, "arguments": args}
-                }]
-            }),
+                });
+                if let Some(calls) = messages
+                    .last_mut()
+                    .filter(|message| message["role"] == "assistant")
+                    .and_then(|message| message["tool_calls"].as_array_mut())
+                {
+                    calls.push(call);
+                } else {
+                    messages.push(json!({
+                        "role": "assistant", "content": "", "tool_calls": [call]
+                    }));
+                }
+            }
             ConversationItem::ToolResult { id, output } => {
                 let name = request
                     .items
@@ -437,16 +477,30 @@ fn ollama_request(model: &str, request: &ModelRequest) -> Value {
                         _ => None,
                     })
                     .unwrap_or("unknown");
-                json!({"role": "tool", "tool_name": name, "content": output})
+                messages.push(json!({"role": "tool", "tool_name": name, "content": output}));
             }
-        })
-        .collect::<Vec<_>>();
+        }
+    }
     let tools = request.tools.iter().map(|tool| json!({
         "type": "function", "function": {
             "name": tool.name, "description": tool.description, "parameters": tool.input_schema
         }
     })).collect::<Vec<_>>();
     json!({"model": model, "messages": messages, "tools": tools, "stream": true})
+}
+
+fn tool_action(mut calls: Vec<ToolCallRequest>) -> AgentAction {
+    if calls.len() == 1 {
+        let call = calls.pop().expect("one call");
+        AgentAction::Tool {
+            id: call.id,
+            tool: call.tool,
+            args: call.args,
+            reason: call.reason,
+        }
+    } else {
+        AgentAction::Tools { calls }
+    }
 }
 
 fn role_name(role: Role) -> &'static str {
@@ -680,8 +734,78 @@ mod tests {
     }
 
     #[test]
+    fn ollama_groups_batch_calls_into_one_assistant_message() {
+        let request = ModelRequest {
+            items: vec![
+                ConversationItem::ToolCall {
+                    id: "a".into(),
+                    name: "read_file".into(),
+                    args: json!({}),
+                },
+                ConversationItem::ToolCall {
+                    id: "b".into(),
+                    name: "search".into(),
+                    args: json!({}),
+                },
+            ],
+            tools: vec![],
+        };
+        let body = ollama_request("qwen3", &request);
+        assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            body["messages"][0]["tool_calls"].as_array().unwrap().len(),
+            2
+        );
+    }
+
+    #[test]
     fn ollama_host_without_scheme_is_normalized() {
         let provider = OllamaProvider::with_base_url("model", "localhost:11434");
         assert_eq!(provider.base_url, "http://localhost:11434");
+    }
+
+    #[test]
+    fn openai_preserves_multiple_tool_calls() {
+        let mut state = OpenAiState::default();
+        for (id, name) in [("call_1", "read_file"), ("call_2", "search")] {
+            state
+                .consume(
+                    json!({"type":"response.output_item.done","item":{
+                        "type":"function_call","call_id":id,"name":name,"arguments":"{}"
+                    }}),
+                    &mut |_| {},
+                )
+                .unwrap();
+        }
+        assert!(
+            matches!(state.finish().unwrap(), AgentAction::Tools { calls } if calls.len() == 2)
+        );
+    }
+
+    #[test]
+    fn anthropic_keeps_arguments_separate_for_multiple_tools() {
+        let mut state = AnthropicState::default();
+        let mut sink = |_| {};
+        for (index, id, name) in [(0, "one", "read_file"), (1, "two", "search")] {
+            state
+                .consume(
+                    json!({"type":"content_block_start","index":index,"content_block":{
+                        "type":"tool_use","id":id,"name":name
+                    }}),
+                    &mut sink,
+                )
+                .unwrap();
+            state
+                .consume(
+                    json!({"type":"content_block_delta","index":index,"delta":{
+                        "type":"input_json_delta","partial_json":"{}"
+                    }}),
+                    &mut sink,
+                )
+                .unwrap();
+        }
+        assert!(
+            matches!(state.finish().unwrap(), AgentAction::Tools { calls } if calls.len() == 2 && calls[1].tool == "search")
+        );
     }
 }

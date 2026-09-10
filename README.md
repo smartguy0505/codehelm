@@ -18,6 +18,7 @@ The Rust workspace currently provides:
 - Injected provider, tool, approval, and event boundaries with deterministic tests
 - Native OpenAI Responses and Anthropic Messages streaming adapters, wired to the Rust CLI
 - Structured tool-call identity preserved across provider turns
+- Multiple tool calls per model turn with deterministic authorization and execution
 - Workspace-contained Rust tools for listing, reading, and regex search
 
 Build and inspect the Rust CLI:

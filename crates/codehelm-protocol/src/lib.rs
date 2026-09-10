@@ -43,6 +43,17 @@ pub struct ModelRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolCallRequest {
+    #[serde(default)]
+    pub id: String,
+    pub tool: String,
+    #[serde(default)]
+    pub args: Value,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentAction {
     Tool {
@@ -53,6 +64,9 @@ pub enum AgentAction {
         args: Value,
         #[serde(default)]
         reason: Option<String>,
+    },
+    Tools {
+        calls: Vec<ToolCallRequest>,
     },
     Final {
         message: String,

@@ -1,5 +1,7 @@
 use async_trait::async_trait;
-use codehelm_protocol::{AgentAction, AgentEvent, ConversationItem, ModelRequest, Role, ToolSpec};
+use codehelm_protocol::{
+    AgentAction, AgentEvent, ConversationItem, ModelRequest, Role, ToolCallRequest, ToolSpec,
+};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -176,53 +178,77 @@ where
                     });
                     return Ok(message);
                 }
-                AgentAction::Tool {
-                    id,
-                    tool,
-                    args,
-                    reason,
-                } => {
-                    let id = if id.is_empty() {
-                        format!("codehelm-{turn}")
-                    } else {
-                        id
+                action @ (AgentAction::Tool { .. } | AgentAction::Tools { .. }) => {
+                    let mut calls = match action {
+                        AgentAction::Tool {
+                            id,
+                            tool,
+                            args,
+                            reason,
+                        } => vec![ToolCallRequest {
+                            id,
+                            tool,
+                            args,
+                            reason,
+                        }],
+                        AgentAction::Tools { calls } => calls,
+                        AgentAction::Final { .. } => unreachable!(),
                     };
-                    self.items.push(ConversationItem::ToolCall {
-                        id: id.clone(),
-                        name: tool.clone(),
-                        args: args.clone(),
-                    });
-                    self.store.save(&self.items)?;
-                    self.events.emit(AgentEvent::ToolStart {
-                        tool: tool.clone(),
-                        args: args.clone(),
-                        reason: reason.clone(),
-                    });
-                    if !self
-                        .approvals
-                        .approve(&tool, &args, reason.as_deref())
-                        .await
-                    {
-                        let message = "permission denied".to_owned();
-                        self.events.emit(AgentEvent::ToolDenied {
-                            tool: tool.clone(),
-                            reason: message.clone(),
-                        });
-                        self.push_tool_result(&id, &message);
-                        self.store.save(&self.items)?;
-                        continue;
+                    if calls.is_empty() {
+                        return Err(AgentError::Provider(
+                            "provider returned an empty tool batch".into(),
+                        ));
                     }
-
-                    let result = match self.tools.execute(&tool, &args).await {
-                        Ok(result) => result,
-                        Err(error) => format!("Tool error: {error}"),
-                    };
-                    self.events.emit(AgentEvent::ToolResult {
-                        tool: tool.clone(),
-                        result: result.clone(),
-                    });
-                    self.push_tool_result(&id, &result);
+                    for (index, call) in calls.iter_mut().enumerate() {
+                        if call.id.is_empty() {
+                            call.id = format!("codehelm-{turn}-{index}");
+                        }
+                        self.items.push(ConversationItem::ToolCall {
+                            id: call.id.clone(),
+                            name: call.tool.clone(),
+                            args: call.args.clone(),
+                        });
+                    }
                     self.store.save(&self.items)?;
+
+                    for call in calls {
+                        let ToolCallRequest {
+                            id,
+                            tool,
+                            args,
+                            reason,
+                        } = call;
+                        self.events.emit(AgentEvent::ToolStart {
+                            tool: tool.clone(),
+                            args: args.clone(),
+                            reason: reason.clone(),
+                        });
+                        if !self
+                            .approvals
+                            .approve(&tool, &args, reason.as_deref())
+                            .await
+                        {
+                            let message = "permission denied".to_owned();
+                            self.events.emit(AgentEvent::ToolDenied {
+                                tool: tool.clone(),
+                                reason: message.clone(),
+                            });
+                            self.push_tool_result(&id, &message);
+                            self.store.save(&self.items)?;
+                            continue;
+                        }
+
+                        let result = match self.tools.execute(&tool, &args).await {
+                            Ok(result) => result,
+                            Err(error) => format!("Tool error: {error}"),
+                        };
+                        self.events.emit(AgentEvent::ToolResult {
+                            tool,
+                            result: result.clone(),
+                        });
+                        self.push_tool_result(&id, &result);
+                        self.store.save(&self.items)?;
+                    }
                 }
             }
         }
@@ -332,5 +358,47 @@ mod tests {
             agent.run("task").await,
             Err(AgentError::MaxTurns(1))
         ));
+    }
+
+    #[tokio::test]
+    async fn preserves_and_executes_every_tool_in_a_batch() {
+        let provider = MockProvider(VecDeque::from([
+            AgentAction::Tools {
+                calls: vec![
+                    ToolCallRequest {
+                        id: "a".into(),
+                        tool: "read_file".into(),
+                        args: Value::Null,
+                        reason: None,
+                    },
+                    ToolCallRequest {
+                        id: "b".into(),
+                        tool: "read_file".into(),
+                        args: Value::Null,
+                        reason: None,
+                    },
+                ],
+            },
+            AgentAction::Final {
+                message: "done".into(),
+            },
+        ]));
+        let mut events = Vec::new();
+        let mut agent = Agent::new(
+            provider,
+            MockTools,
+            Allow,
+            |event| events.push(event),
+            "system",
+            2,
+        );
+        assert_eq!(agent.run("task").await.unwrap(), "done");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::ToolResult { .. }))
+                .count(),
+            2
+        );
     }
 }
