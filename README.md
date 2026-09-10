@@ -101,6 +101,8 @@ For OpenAI-compatible gateways, set `provider` to `openai-compatible`, provide `
 
 Configure MCP stdio servers under `mcpServers`. CodeHelm negotiates the stable `2025-11-25` lifecycle, exposes tools as `mcp__<server>__<tool>`, bounds every message and request, and asks for approval before each MCP call. Server commands are launched directly without a shell.
 
+Use `permissions.allowMcpTools` and `permissions.denyMcpTools` glob patterns for unattended MCP policy. Denials take precedence and cannot be bypassed by `--yes`; unmatched MCP tools require approval.
+
 ## Commands
 
 ```text
@@ -146,6 +148,8 @@ Merged configuration is validated before execution. Invalid URLs, permission glo
   "permissions": {
     "allowCommands": ["git status", "git diff", "npm test"],
     "denyCommands": ["rm", "sudo", "git reset --hard"],
+    "allowMcpTools": ["mcp__docs__search*"],
+    "denyMcpTools": ["mcp__*__delete*"],
     "askWrite": ["generated/**"],
     "denyRead": [".env", ".env.*", "**/*.pem", "**/*.key"],
     "denyWrite": [".git/**", ".env", "**/*.key"]

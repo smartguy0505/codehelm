@@ -706,7 +706,10 @@ impl<F> PolicyApproval<F> {
             "run_command" => args["command"].as_str().map_or(Decision::Deny, |command| {
                 self.policy.command_decision(command)
             }),
-            tool if tool.starts_with("mcp__") => Decision::Ask,
+            tool if tool.starts_with("mcp__") => self
+                .policy
+                .mcp_tool_decision(tool)
+                .unwrap_or(Decision::Deny),
             _ => Decision::Deny,
         }
     }

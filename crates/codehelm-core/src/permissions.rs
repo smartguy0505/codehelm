@@ -12,6 +12,8 @@ use thiserror::Error;
 pub struct PermissionPolicy {
     pub allow_commands: Vec<String>,
     pub deny_commands: Vec<String>,
+    pub allow_mcp_tools: Vec<String>,
+    pub deny_mcp_tools: Vec<String>,
     pub deny_read: Vec<String>,
     pub ask_write: Vec<String>,
     pub deny_write: Vec<String>,
@@ -48,6 +50,8 @@ impl Default for PermissionPolicy {
             .into_iter()
             .map(str::to_owned)
             .collect(),
+            allow_mcp_tools: Vec::new(),
+            deny_mcp_tools: Vec::new(),
             deny_read: [
                 ".env",
                 ".env.*",
@@ -112,6 +116,8 @@ impl PermissionPolicy {
         build_globs(&self.deny_read)?;
         build_globs(&self.ask_write)?;
         build_globs(&self.deny_write)?;
+        build_globs(&self.allow_mcp_tools)?;
+        build_globs(&self.deny_mcp_tools)?;
         if self
             .allow_commands
             .iter()
@@ -138,6 +144,16 @@ impl PermissionPolicy {
         } else {
             Decision::Ask
         }
+    }
+
+    pub fn mcp_tool_decision(&self, tool: &str) -> Result<Decision, PermissionError> {
+        Ok(if build_globs(&self.deny_mcp_tools)?.is_match(tool) {
+            Decision::Deny
+        } else if build_globs(&self.allow_mcp_tools)?.is_match(tool) {
+            Decision::Allow
+        } else {
+            Decision::Ask
+        })
     }
 
     pub fn read_decision(&self, path: &Path) -> Result<Decision, PermissionError> {
@@ -266,6 +282,25 @@ mod tests {
         assert_eq!(
             policy.read_decision(Path::new("src/main.rs")).unwrap(),
             Decision::Allow
+        );
+    }
+
+    #[test]
+    fn mcp_denials_override_allows() {
+        let mut policy = PermissionPolicy::default();
+        policy.allow_mcp_tools.push("mcp__docs__*".into());
+        policy.deny_mcp_tools.push("mcp__docs__delete*".into());
+        assert_eq!(
+            policy.mcp_tool_decision("mcp__docs__search").unwrap(),
+            Decision::Allow
+        );
+        assert_eq!(
+            policy.mcp_tool_decision("mcp__docs__delete_page").unwrap(),
+            Decision::Deny
+        );
+        assert_eq!(
+            policy.mcp_tool_decision("mcp__other__search").unwrap(),
+            Decision::Ask
         );
     }
 
