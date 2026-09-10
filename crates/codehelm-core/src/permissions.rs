@@ -103,9 +103,26 @@ pub enum PermissionError {
         pattern: String,
         source: globset::Error,
     },
+    #[error("permission command entries must not be empty")]
+    EmptyCommand,
 }
 
 impl PermissionPolicy {
+    pub fn validate(&self) -> Result<(), PermissionError> {
+        build_globs(&self.deny_read)?;
+        build_globs(&self.ask_write)?;
+        build_globs(&self.deny_write)?;
+        if self
+            .allow_commands
+            .iter()
+            .chain(&self.deny_commands)
+            .any(|command| command.trim().is_empty())
+        {
+            return Err(PermissionError::EmptyCommand);
+        }
+        Ok(())
+    }
+
     pub fn command_decision(&self, command: &str) -> Decision {
         let normalized = command.split_whitespace().collect::<Vec<_>>().join(" ");
         if normalized.is_empty()

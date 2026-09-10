@@ -95,6 +95,8 @@ pub enum ConfigError {
     },
     #[error("merged configuration is invalid: {0}")]
     Invalid(serde_json::Error),
+    #[error("invalid configuration: {0}")]
+    Validation(String),
 }
 
 pub fn load_config(cwd: &Path, overrides: ConfigOverrides) -> Result<Config, ConfigError> {
@@ -118,7 +120,81 @@ pub fn load_config(cwd: &Path, overrides: ConfigOverrides) -> Result<Config, Con
         value["maxTurns"] = Value::from(max_turns);
     }
 
-    serde_json::from_value(value).map_err(ConfigError::Invalid)
+    let config: Config = serde_json::from_value(value).map_err(ConfigError::Invalid)?;
+    config.validate()?;
+    Ok(config)
+}
+
+impl Config {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.model.trim().is_empty() {
+            return Err(ConfigError::Validation("model must not be empty".into()));
+        }
+        validate_range("maxTurns", self.max_turns as u64, 1, 1_000)?;
+        validate_range("commandTimeoutMs", self.command_timeout_ms, 1, 86_400_000)?;
+        validate_range("providerTimeoutMs", self.provider_timeout_ms, 1, 86_400_000)?;
+        validate_range(
+            "maxToolOutputChars",
+            self.max_tool_output_chars as u64,
+            1,
+            10_000_000,
+        )?;
+        validate_range(
+            "maxInstructionChars",
+            self.max_instruction_chars as u64,
+            1,
+            10_000_000,
+        )?;
+        validate_range(
+            "maxContextChars",
+            self.max_context_chars as u64,
+            1,
+            10_000_000,
+        )?;
+        validate_range(
+            "providerMaxRetries",
+            self.provider_max_retries as u64,
+            0,
+            20,
+        )?;
+        if self.provider_max_retries > 0 {
+            validate_range(
+                "providerRetryBaseMs",
+                self.provider_retry_base_ms,
+                1,
+                60_000,
+            )?;
+        }
+        if self.max_total_tokens == Some(0) {
+            return Err(ConfigError::Validation(
+                "maxTotalTokens must be greater than zero when set".into(),
+            ));
+        }
+        if let Some(base_url) = &self.base_url {
+            let parsed = reqwest::Url::parse(base_url).map_err(|error| {
+                ConfigError::Validation(format!("baseUrl is not a valid URL: {error}"))
+            })?;
+            if !matches!(parsed.scheme(), "http" | "https") {
+                return Err(ConfigError::Validation(
+                    "baseUrl must use http or https".into(),
+                ));
+            }
+        }
+        self.permissions
+            .validate()
+            .map_err(|error| ConfigError::Validation(error.to_string()))?;
+        Ok(())
+    }
+}
+
+fn validate_range(name: &str, value: u64, min: u64, max: u64) -> Result<(), ConfigError> {
+    if (min..=max).contains(&value) {
+        Ok(())
+    } else {
+        Err(ConfigError::Validation(format!(
+            "{name} must be between {min} and {max}"
+        )))
+    }
 }
 
 fn merge_file(target: &mut Value, path: &Path) -> Result<(), ConfigError> {
@@ -170,5 +246,54 @@ mod tests {
         let value = serde_json::to_value(Config::default()).unwrap();
         let restored: Config = serde_json::from_value(value).unwrap();
         assert_eq!(restored, Config::default());
+        restored.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_unsafe_or_nonsensical_limits() {
+        let mut config = Config {
+            max_turns: 0,
+            ..Config::default()
+        };
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("maxTurns")
+        );
+        config = Config {
+            provider_max_retries: 21,
+            ..Config::default()
+        };
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("providerMaxRetries")
+        );
+        config = Config {
+            max_total_tokens: Some(0),
+            ..Config::default()
+        };
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("maxTotalTokens")
+        );
+    }
+
+    #[test]
+    fn validates_provider_base_url() {
+        let mut config = Config {
+            base_url: Some("file:///tmp/provider".into()),
+            ..Config::default()
+        };
+        assert!(config.validate().is_err());
+        config.base_url = Some("http://127.0.0.1:11434".into());
+        config.validate().unwrap();
     }
 }

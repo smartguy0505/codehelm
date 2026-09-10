@@ -119,6 +119,8 @@ Shell commands outside the configured allowlist require confirmation. In non-int
 
 Project configuration lives in `.codehelm/config.json`. Global defaults can be placed in `~/.config/codehelm/config.json`. Project values override global values, and CLI flags override both.
 
+Merged configuration is validated before execution. Invalid URLs, permission globs, empty model names, zero resource limits, and excessive retry/turn limits fail fast with a specific configuration error.
+
 ```json
 {
   "provider": "openai",
