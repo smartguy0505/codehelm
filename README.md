@@ -35,6 +35,8 @@ The Rust CLI supports live `plan`, `review`, `exec`, and transactional `build` r
 
 Rust build mode can also run configured allowlisted commands directly, without invoking a shell. Commands are bounded by configured timeout and output limits; OS-level filesystem and network isolation remains on the roadmap.
 
+Command stdout and stderr are drained concurrently with bounded in-memory capture, preventing noisy subprocesses from exhausting agent memory or deadlocking on full pipes. Child processes receive a minimal allowlisted environment instead of inheriting API keys and unrelated credentials.
+
 Commands outside `allowCommands` require an interactive confirmation. Headless runs deny these ask-level actions unless `--yes` is supplied; denylisted commands and protected paths remain blocked even with `--yes`. Paths matching optional `permissions.askWrite` patterns use the same approval flow.
 
 Proposed file writes and exact replacements produce a bounded unified diff before approval and execution. Preview validation is read-only, respects sensitive-path policy, and catches stale replacement targets before prompting.

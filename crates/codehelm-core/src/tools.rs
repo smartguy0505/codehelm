@@ -1,13 +1,14 @@
 use std::{
-    fs,
+    env, fs,
     io::Write,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
 };
 
 use async_trait::async_trait;
 use codehelm_protocol::ToolSpec;
 use serde_json::{Value, json};
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::{
     agent::{AgentError, ApprovalHandler, ToolExecutor},
@@ -456,24 +457,59 @@ impl WorkspaceTools {
         let timeout_ms = self
             .command_timeout_ms
             .ok_or_else(|| tool_error("run_command", "command execution is disabled"))?;
-        let child = tokio::process::Command::new(program)
+        let mut command = tokio::process::Command::new(program);
+        command
             .args(arguments)
             .current_dir(&self.root)
+            .env_clear()
+            .envs(safe_command_env())
             .env("CODEHELM_AGENT", "1")
-            .kill_on_drop(true)
-            .output();
-        let output = tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), child)
-            .await
-            .map_err(|_| tool_error("run_command", format!("timed out after {timeout_ms}ms")))?
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = command
+            .spawn()
             .map_err(|error| tool_error("run_command", error))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| tool_error("run_command", "failed to capture stdout"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| tool_error("run_command", "failed to capture stderr"))?;
+        let byte_limit = self.max_output_chars.saturating_mul(4).max(1);
+        let execution = async {
+            let (status, stdout, stderr) = tokio::join!(
+                child.wait(),
+                capture_bounded(stdout, byte_limit),
+                capture_bounded(stderr, byte_limit)
+            );
+            Ok::<_, std::io::Error>((status?, stdout?, stderr?))
+        };
+        let (status, stdout, stderr) =
+            tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), execution)
+                .await
+                .map_err(|_| tool_error("run_command", format!("timed out after {timeout_ms}ms")))?
+                .map_err(|error| tool_error("run_command", error))?;
         let combined = format!(
-            "exit code: {}\n{}{}",
-            output
-                .status
+            "exit code: {}\n{}{}{}{}",
+            status
                 .code()
                 .map_or_else(|| "signal".into(), |code| code.to_string()),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            String::from_utf8_lossy(&stdout.bytes),
+            if stdout.truncated {
+                "\n… stdout truncated\n"
+            } else {
+                ""
+            },
+            String::from_utf8_lossy(&stderr.bytes),
+            if stderr.truncated {
+                "\n… stderr truncated"
+            } else {
+                ""
+            }
         );
         Ok(self.truncate(combined.trim_end().to_owned()))
     }
@@ -488,6 +524,53 @@ impl WorkspaceTools {
             .collect::<String>();
         format!("{kept}\n… output truncated")
     }
+}
+
+struct CapturedOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+async fn capture_bounded(
+    mut reader: impl AsyncRead + Unpin,
+    limit: usize,
+) -> std::io::Result<CapturedOutput> {
+    let mut bytes = Vec::with_capacity(limit.min(64 * 1024));
+    let mut buffer = [0_u8; 8 * 1024];
+    let mut truncated = false;
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        let remaining = limit.saturating_sub(bytes.len());
+        let keep = remaining.min(read);
+        bytes.extend_from_slice(&buffer[..keep]);
+        truncated |= keep < read;
+    }
+    Ok(CapturedOutput { bytes, truncated })
+}
+
+fn safe_command_env() -> Vec<(String, std::ffi::OsString)> {
+    const ALLOWED: &[&str] = &[
+        "PATH",
+        "HOME",
+        "USERPROFILE",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "LANG",
+        "LC_ALL",
+        "TERM",
+        "NO_COLOR",
+        "CI",
+        "CARGO_HOME",
+        "RUSTUP_HOME",
+    ];
+    ALLOWED
+        .iter()
+        .filter_map(|name| env::var_os(name).map(|value| ((*name).to_owned(), value)))
+        .collect()
 }
 
 #[async_trait(?Send)]
@@ -730,6 +813,7 @@ fn unified_diff(path: &str, old: &str, new: &str) -> String {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::io::AsyncWriteExt;
 
     fn workspace() -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -880,6 +964,57 @@ mod tests {
                 .to_string()
                 .contains("denied by policy")
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn command_capture_drains_but_retains_only_the_limit() {
+        let (mut writer, reader) = tokio::io::duplex(32);
+        let write = tokio::spawn(async move {
+            writer.write_all(&vec![b'x'; 10_000]).await.unwrap();
+        });
+        let captured = capture_bounded(reader, 64).await.unwrap();
+        write.await.unwrap();
+        assert_eq!(captured.bytes.len(), 64);
+        assert!(captured.truncated);
+    }
+
+    #[tokio::test]
+    async fn commands_receive_only_sanitized_environment() {
+        let root = workspace();
+        let mut policy = PermissionPolicy::default();
+        policy.allow_commands.push("env".into());
+        let mut tools = WorkspaceTools::new(&root, policy, 10_000)
+            .unwrap()
+            .enable_commands(5_000);
+        let result = tools
+            .execute("run_command", &json!({"command":"env"}))
+            .await
+            .unwrap();
+        let allowed = [
+            "PATH",
+            "HOME",
+            "USERPROFILE",
+            "TMPDIR",
+            "TEMP",
+            "TMP",
+            "LANG",
+            "LC_ALL",
+            "TERM",
+            "NO_COLOR",
+            "CI",
+            "CARGO_HOME",
+            "RUSTUP_HOME",
+            "CODEHELM_AGENT",
+        ];
+        for line in result.lines().skip(1).filter(|line| line.contains('=')) {
+            let name = line.split_once('=').unwrap().0;
+            assert!(
+                allowed.contains(&name),
+                "unexpected inherited variable: {name}"
+            );
+        }
+        assert!(result.contains("CODEHELM_AGENT=1"));
         fs::remove_dir_all(root).unwrap();
     }
 
