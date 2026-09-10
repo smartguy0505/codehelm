@@ -49,6 +49,7 @@ pub struct Config {
     pub max_context_chars: usize,
     pub provider_max_retries: usize,
     pub provider_retry_base_ms: u64,
+    pub provider_timeout_ms: u64,
     pub max_total_tokens: Option<u64>,
     pub permissions: crate::permissions::PermissionPolicy,
 }
@@ -66,6 +67,7 @@ impl Default for Config {
             max_context_chars: 400_000,
             provider_max_retries: 3,
             provider_retry_base_ms: 500,
+            provider_timeout_ms: 300_000,
             max_total_tokens: None,
             permissions: Default::default(),
         }

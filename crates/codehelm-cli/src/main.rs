@@ -231,6 +231,7 @@ async fn run_agent_with_session(
         max_retries: config.provider_max_retries,
         base_delay_ms: config.provider_retry_base_ms,
     };
+    let provider_timeout = std::time::Duration::from_millis(config.provider_timeout_ms.max(1));
     let provider: Box<dyn ModelProvider> = match config.provider {
         Provider::Openai | Provider::OpenaiCompatible => {
             let key = api_key("OPENAI_API_KEY")?;
@@ -239,7 +240,11 @@ async fn run_agent_with_session(
             } else {
                 OpenAiProvider::new(key, &config.model)
             };
-            Box::new(provider.with_retry_policy(retry))
+            Box::new(
+                provider
+                    .with_retry_policy(retry)
+                    .with_request_timeout(provider_timeout),
+            )
         }
         Provider::Anthropic => {
             let key = api_key("ANTHROPIC_API_KEY")?;
@@ -248,7 +253,11 @@ async fn run_agent_with_session(
             } else {
                 AnthropicProvider::new(key, &config.model)
             };
-            Box::new(provider.with_retry_policy(retry))
+            Box::new(
+                provider
+                    .with_retry_policy(retry)
+                    .with_request_timeout(provider_timeout),
+            )
         }
         Provider::Ollama => {
             let base_url = config
@@ -260,7 +269,11 @@ async fn run_agent_with_session(
             } else {
                 OllamaProvider::new(&config.model)
             };
-            Box::new(provider.with_retry_policy(retry))
+            Box::new(
+                provider
+                    .with_retry_policy(retry)
+                    .with_request_timeout(provider_timeout),
+            )
         }
     };
     let mut tools = WorkspaceTools::new(

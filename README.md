@@ -49,6 +49,8 @@ Pressing Ctrl-C cancels an active provider stream or command, journals the inter
 
 Transient connection failures, timeouts, rate limits, and server errors are retried before streaming begins with bounded exponential backoff. Retry attempts are journaled and exposed in NDJSON output; partial streams are never replayed automatically.
 
+Provider calls have a configurable end-to-end deadline, and incomplete SSE/NDJSON frames are capped at 1 MiB. Error response bodies are sampled with a fixed bound instead of being loaded without limit.
+
 Provider-reported token usage is normalized across OpenAI, Anthropic, and Ollama, displayed after each model call, and saved in the event journal. Set `maxTotalTokens` to stop a run before it performs another tool action after crossing the budget.
 
 Provider requests use a bounded recent context window while the durable session keeps the complete history. Compaction preserves system instructions and whole tool-call/result units, and emits a journal event whenever older items are omitted.
@@ -126,6 +128,7 @@ Project configuration lives in `.codehelm/config.json`. Global defaults can be p
   "maxContextChars": 400000,
   "providerMaxRetries": 3,
   "providerRetryBaseMs": 500,
+  "providerTimeoutMs": 300000,
   "maxTotalTokens": 100000,
   "permissions": {
     "allowCommands": ["git status", "git diff", "npm test"],

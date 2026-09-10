@@ -10,6 +10,9 @@ use serde_json::{Value, json};
 
 use crate::agent::{AgentError, EventSink, ModelProvider};
 
+const MAX_PROVIDER_FRAME_BYTES: usize = 1024 * 1024;
+const MAX_ERROR_BODY_BYTES: usize = 800;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetryPolicy {
     pub max_retries: usize,
@@ -31,6 +34,7 @@ pub struct OpenAiProvider {
     base_url: String,
     model: String,
     retry: RetryPolicy,
+    request_timeout: std::time::Duration,
 }
 
 impl OpenAiProvider {
@@ -49,11 +53,17 @@ impl OpenAiProvider {
             base_url: base_url.into().trim_end_matches('/').to_owned(),
             model: model.into(),
             retry: RetryPolicy::default(),
+            request_timeout: std::time::Duration::from_secs(300),
         }
     }
 
     pub fn with_retry_policy(mut self, retry: RetryPolicy) -> Self {
         self.retry = retry;
+        self
+    }
+
+    pub fn with_request_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.request_timeout = timeout;
         self
     }
 }
@@ -69,6 +79,7 @@ impl ModelProvider for OpenAiProvider {
             .client
             .post(format!("{}/responses", self.base_url))
             .bearer_auth(&self.api_key)
+            .timeout(self.request_timeout)
             .json(&openai_request(&self.model, request));
         let response = send_with_retry(request, self.retry, events).await?;
         let mut state = OpenAiState::default();
@@ -185,6 +196,7 @@ pub struct AnthropicProvider {
     model: String,
     max_tokens: usize,
     retry: RetryPolicy,
+    request_timeout: std::time::Duration,
 }
 
 impl AnthropicProvider {
@@ -204,11 +216,17 @@ impl AnthropicProvider {
             model: model.into(),
             max_tokens: 8_192,
             retry: RetryPolicy::default(),
+            request_timeout: std::time::Duration::from_secs(300),
         }
     }
 
     pub fn with_retry_policy(mut self, retry: RetryPolicy) -> Self {
         self.retry = retry;
+        self
+    }
+
+    pub fn with_request_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.request_timeout = timeout;
         self
     }
 }
@@ -225,6 +243,7 @@ impl ModelProvider for AnthropicProvider {
             .post(format!("{}/v1/messages", self.base_url))
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
+            .timeout(self.request_timeout)
             .json(&anthropic_request(&self.model, self.max_tokens, request));
         let response = send_with_retry(request, self.retry, events).await?;
         let mut state = AnthropicState::default();
@@ -392,6 +411,7 @@ pub struct OllamaProvider {
     base_url: String,
     model: String,
     retry: RetryPolicy,
+    request_timeout: std::time::Duration,
 }
 
 impl OllamaProvider {
@@ -411,11 +431,17 @@ impl OllamaProvider {
             base_url: base_url.trim_end_matches('/').to_owned(),
             model: model.into(),
             retry: RetryPolicy::default(),
+            request_timeout: std::time::Duration::from_secs(300),
         }
     }
 
     pub fn with_retry_policy(mut self, retry: RetryPolicy) -> Self {
         self.retry = retry;
+        self
+    }
+
+    pub fn with_request_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.request_timeout = timeout;
         self
     }
 }
@@ -430,6 +456,7 @@ impl ModelProvider for OllamaProvider {
         let request = self
             .client
             .post(format!("{}/api/chat", self.base_url))
+            .timeout(self.request_timeout)
             .json(&ollama_request(&self.model, request));
         let response = send_with_retry(request, self.retry, events).await?;
         let mut state = OllamaState::default();
@@ -652,11 +679,7 @@ async fn stream_sse(
 ) -> Result<(), AgentError> {
     let status = response.status();
     if !status.is_success() {
-        let body = response.text().await.map_err(provider_error)?;
-        return Err(AgentError::Provider(format!(
-            "HTTP {status}: {}",
-            body.chars().take(800).collect::<String>()
-        )));
+        return Err(http_status_error(response).await);
     }
     let mut stream = response.bytes_stream();
     let mut buffer = Vec::new();
@@ -677,6 +700,7 @@ async fn stream_sse(
                 }
             }
         }
+        ensure_frame_limit(&buffer)?;
     }
     Ok(())
 }
@@ -687,11 +711,7 @@ async fn stream_ndjson(
 ) -> Result<(), AgentError> {
     let status = response.status();
     if !status.is_success() {
-        let body = response.text().await.map_err(provider_error)?;
-        return Err(AgentError::Provider(format!(
-            "HTTP {status}: {}",
-            body.chars().take(800).collect::<String>()
-        )));
+        return Err(http_status_error(response).await);
     }
     let mut stream = response.bytes_stream();
     let mut buffer = Vec::new();
@@ -702,8 +722,38 @@ async fn stream_ndjson(
             buffer.drain(..1);
             consume_json_line(&line, &mut consume)?;
         }
+        ensure_frame_limit(&buffer)?;
     }
     consume_json_line(&buffer, &mut consume)
+}
+
+fn ensure_frame_limit(buffer: &[u8]) -> Result<(), AgentError> {
+    if buffer.len() > MAX_PROVIDER_FRAME_BYTES {
+        Err(AgentError::Provider(format!(
+            "provider stream frame exceeded {MAX_PROVIDER_FRAME_BYTES} bytes"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+async fn http_status_error(response: Response) -> AgentError {
+    let status = response.status();
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    while body.len() < MAX_ERROR_BODY_BYTES {
+        let Some(chunk) = stream.next().await else {
+            break;
+        };
+        match chunk {
+            Ok(chunk) => {
+                let keep = (MAX_ERROR_BODY_BYTES - body.len()).min(chunk.len());
+                body.extend_from_slice(&chunk[..keep]);
+            }
+            Err(error) => return provider_error(error),
+        }
+    }
+    AgentError::Provider(format!("HTTP {status}: {}", String::from_utf8_lossy(&body)))
 }
 
 fn consume_json_line(
@@ -765,6 +815,36 @@ mod tests {
             .unwrap();
         assert!(
             matches!(state.finish().unwrap(), AgentAction::Tool { id, tool, .. } if id == "call_1" && tool == "read_file")
+        );
+    }
+
+    #[test]
+    fn provider_frames_have_a_hard_memory_boundary() {
+        assert!(ensure_frame_limit(&vec![0; MAX_PROVIDER_FRAME_BYTES]).is_ok());
+        let error = ensure_frame_limit(&vec![0; MAX_PROVIDER_FRAME_BYTES + 1]).unwrap_err();
+        assert!(error.to_string().contains("frame exceeded"));
+    }
+
+    #[test]
+    fn provider_request_deadlines_are_configurable() {
+        let timeout = std::time::Duration::from_millis(1234);
+        assert_eq!(
+            OpenAiProvider::new("key", "model")
+                .with_request_timeout(timeout)
+                .request_timeout,
+            timeout
+        );
+        assert_eq!(
+            AnthropicProvider::new("key", "model")
+                .with_request_timeout(timeout)
+                .request_timeout,
+            timeout
+        );
+        assert_eq!(
+            OllamaProvider::new("model")
+                .with_request_timeout(timeout)
+                .request_timeout,
+            timeout
         );
     }
 
