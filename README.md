@@ -16,8 +16,9 @@ The Rust workspace currently provides:
 - A stable, serializable agent action and event protocol
 - A provider-neutral async agent loop with incremental model events
 - Injected provider, tool, approval, and event boundaries with deterministic tests
-- Native OpenAI Responses and Anthropic Messages streaming adapters
+- Native OpenAI Responses and Anthropic Messages streaming adapters, wired to the Rust CLI
 - Structured tool-call identity preserved across provider turns
+- Workspace-contained Rust tools for listing, reading, and regex search
 
 Build and inspect the Rust CLI:
 
@@ -25,9 +26,10 @@ Build and inspect the Rust CLI:
 cargo build --release
 ./target/release/codehelm --help
 ./target/release/codehelm config
+OPENAI_API_KEY="..." ./target/release/codehelm plan "explain this architecture"
 ```
 
-Live agent execution still uses the JavaScript CLI during this migration. The Rust core now executes provider-native streaming tool-use loops; the next slice will connect it to secured filesystem tools and the Rust CLI.
+The Rust CLI now supports live, read-only `plan`, `review`, and `exec` runs through OpenAI and Anthropic. Build-mode edits remain on the JavaScript CLI until transactional Rust editing and sandboxed command execution are ready.
 
 ## Features
 
@@ -133,7 +135,7 @@ node ./bin/codehelm.js --help
 
 ## Roadmap
 
-- Connect the Rust agent runtime to secured filesystem tools and the CLI
+- Transactional Rust editing with checkpoints and rollback
 - Patch-based edits with visual diff approval
 - Git worktree checkpoints and rollback
 - MCP client and plugin/skill system

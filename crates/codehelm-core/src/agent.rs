@@ -25,6 +25,17 @@ pub trait ModelProvider {
 }
 
 #[async_trait(?Send)]
+impl<T: ModelProvider + ?Sized> ModelProvider for Box<T> {
+    async fn respond(
+        &mut self,
+        request: &ModelRequest,
+        events: &mut dyn EventSink,
+    ) -> Result<AgentAction, AgentError> {
+        (**self).respond(request, events).await
+    }
+}
+
+#[async_trait(?Send)]
 pub trait ToolExecutor {
     fn specs(&self) -> Vec<ToolSpec>;
 

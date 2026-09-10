@@ -1,11 +1,16 @@
 use std::{
-    fs,
+    env, fs,
+    io::{self, Write},
     path::{Path, PathBuf},
     process::ExitCode,
 };
 
 use clap::{Parser, Subcommand, ValueEnum};
-use codehelm_core::{Config, Provider, config::ConfigOverrides, load_config};
+use codehelm_core::{
+    Agent, AnthropicProvider, Config, ModelProvider, OpenAiProvider, Provider, ReadOnlyApproval,
+    WorkspaceTools, config::ConfigOverrides, load_config,
+};
+use codehelm_protocol::AgentEvent;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -60,7 +65,8 @@ enum Command {
     Config,
 }
 
-fn main() -> ExitCode {
+#[tokio::main]
+async fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
@@ -68,7 +74,7 @@ fn main() -> ExitCode {
         .with_target(false)
         .init();
 
-    match run(Cli::parse()) {
+    match run(Cli::parse()).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("codehelm: {error}");
@@ -77,7 +83,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let cwd = std::env::current_dir()?;
     if matches!(cli.command, Some(Command::Init)) {
         initialize(&cwd)?;
@@ -99,9 +105,116 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command.unwrap_or(Command::Chat) {
         Command::Config => println!("{}", serde_json::to_string_pretty(&config)?),
+        Command::Plan { task } => run_agent(&cwd, &config, &task, "plan", cli.json).await?,
+        Command::Exec { task } => run_agent(&cwd, &config, &task, "exec", cli.json).await?,
+        Command::Review { focus } => {
+            let task = focus.map_or_else(
+                || "Review the current repository changes.".into(),
+                |focus| format!("Review the current repository changes, focusing on {focus}."),
+            );
+            run_agent(&cwd, &config, &task, "review", cli.json).await?;
+        }
         command => print_migration_status(command, &config, cli.json),
     }
     Ok(())
+}
+
+async fn run_agent(
+    cwd: &Path,
+    config: &Config,
+    task: &str,
+    mode: &str,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let provider: Box<dyn ModelProvider> = match config.provider {
+        Provider::Openai | Provider::OpenaiCompatible => {
+            let key = api_key("OPENAI_API_KEY")?;
+            let provider = if let Some(base_url) = &config.base_url {
+                OpenAiProvider::with_base_url(key, &config.model, base_url)
+            } else {
+                OpenAiProvider::new(key, &config.model)
+            };
+            Box::new(provider)
+        }
+        Provider::Anthropic => {
+            let key = api_key("ANTHROPIC_API_KEY")?;
+            let provider = if let Some(base_url) = &config.base_url {
+                AnthropicProvider::with_base_url(key, &config.model, base_url)
+            } else {
+                AnthropicProvider::new(key, &config.model)
+            };
+            Box::new(provider)
+        }
+        Provider::Ollama => return Err("the native Ollama adapter is not implemented yet".into()),
+    };
+    let tools = WorkspaceTools::new(
+        cwd,
+        config.permissions.clone(),
+        config.max_tool_output_chars,
+    )?;
+    let instructions = project_instructions(cwd)?;
+    let system = format!(
+        "You are CodeHelm, a careful coding agent. Mode: {mode}. This Rust runtime is read-only: inspect the repository with the provided tools and return a concise, evidence-based answer. Never invent tool results.\n\nProject instructions:\n{instructions}"
+    );
+    let mut events = move |event: AgentEvent| render_event(event, json);
+    let mut agent = Agent::new(
+        provider,
+        tools,
+        ReadOnlyApproval,
+        &mut events,
+        system,
+        config.max_turns,
+    );
+    agent.run(task).await?;
+    Ok(())
+}
+
+fn api_key(provider_variable: &str) -> Result<String, Box<dyn std::error::Error>> {
+    env::var("CODEHELM_API_KEY")
+        .or_else(|_| env::var(provider_variable))
+        .map_err(|_| format!("set {provider_variable} or CODEHELM_API_KEY").into())
+}
+
+fn project_instructions(cwd: &Path) -> io::Result<String> {
+    let mut sections = Vec::new();
+    for name in ["AGENTS.md", "CLAUDE.md"] {
+        match fs::read_to_string(cwd.join(name)) {
+            Ok(content) => sections.push(format!("## {name}\n{content}")),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(if sections.is_empty() {
+        "(none)".into()
+    } else {
+        sections.join("\n\n")
+    })
+}
+
+fn render_event(event: AgentEvent, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(&event).expect("event serializes")
+        );
+        return;
+    }
+    match event {
+        AgentEvent::ModelDelta { delta } => {
+            print!("{delta}");
+            let _ = io::stdout().flush();
+        }
+        AgentEvent::ModelComplete { .. } => println!(),
+        AgentEvent::ToolStart { tool, reason, .. } => {
+            if let Some(reason) = reason {
+                eprintln!("→ {tool}: {reason}");
+            } else {
+                eprintln!("→ {tool}");
+            }
+        }
+        AgentEvent::ToolDenied { tool, reason } => eprintln!("denied {tool}: {reason}"),
+        _ => {}
+    }
 }
 
 fn initialize(cwd: &Path) -> Result<(), Box<dyn std::error::Error>> {

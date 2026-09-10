@@ -191,7 +191,9 @@ version = "0.2.0"
 dependencies = [
  "clap",
  "codehelm-core",
+ "codehelm-protocol",
  "serde_json",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]
