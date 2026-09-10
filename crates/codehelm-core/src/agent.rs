@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use codehelm_protocol::{
-    AgentAction, AgentEvent, ConversationItem, ModelRequest, Role, ToolCallRequest, ToolSpec,
+    AgentAction, AgentEvent, ConversationItem, ModelRequest, Role, TokenUsage, ToolCallRequest,
+    ToolSpec,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -17,6 +18,8 @@ pub enum AgentError {
     Session(String),
     #[error("agent run cancelled")]
     Cancelled,
+    #[error("agent exceeded token budget of {limit} tokens (used {used})")]
+    TokenBudget { limit: u64, used: u64 },
 }
 
 /// Provider boundary. Implementations translate vendor-native streaming and tool
@@ -93,6 +96,8 @@ pub struct Agent<P, T, A, E, S = NoopStore> {
     items: Vec<ConversationItem>,
     max_turns: usize,
     store: S,
+    max_total_tokens: Option<u64>,
+    total_tokens: u64,
 }
 
 impl<P, T, A, E> Agent<P, T, A, E, NoopStore>
@@ -121,6 +126,8 @@ where
             }],
             max_turns,
             store: NoopStore,
+            max_total_tokens: None,
+            total_tokens: 0,
         }
     }
 
@@ -138,7 +145,14 @@ where
             items: self.items,
             max_turns: self.max_turns,
             store,
+            max_total_tokens: self.max_total_tokens,
+            total_tokens: self.total_tokens,
         }
+    }
+
+    pub fn with_token_budget(mut self, max_total_tokens: Option<u64>) -> Self {
+        self.max_total_tokens = max_total_tokens;
+        self
     }
 }
 
@@ -164,8 +178,23 @@ where
                 items: self.items.clone(),
                 tools: self.tools.specs(),
             };
-            let action = self.provider.respond(&request, &mut self.events).await?;
+            let mut usage = TokenUsage::default();
+            let mut events = UsageTrackingSink {
+                inner: &mut self.events,
+                usage: &mut usage,
+            };
+            let action = self.provider.respond(&request, &mut events).await?;
+            self.total_tokens = self.total_tokens.saturating_add(usage.total());
             self.events.emit(AgentEvent::ModelComplete { turn });
+            if let Some(limit) = self
+                .max_total_tokens
+                .filter(|limit| self.total_tokens > *limit)
+            {
+                return Err(AgentError::TokenBudget {
+                    limit,
+                    used: self.total_tokens,
+                });
+            }
 
             match action {
                 AgentAction::Final { message } => {
@@ -262,6 +291,20 @@ where
             id: id.to_owned(),
             output: result.to_owned(),
         });
+    }
+}
+
+struct UsageTrackingSink<'a, E> {
+    inner: &'a mut E,
+    usage: &'a mut TokenUsage,
+}
+
+impl<E: EventSink> EventSink for UsageTrackingSink<'_, E> {
+    fn emit(&mut self, event: AgentEvent) {
+        if let AgentEvent::Usage { usage } = &event {
+            *self.usage = *usage;
+        }
+        self.inner.emit(event);
     }
 }
 
@@ -401,6 +444,58 @@ mod tests {
                 .filter(|event| matches!(event, AgentEvent::ToolResult { .. }))
                 .count(),
             2
+        );
+    }
+
+    struct UsageProvider;
+
+    #[async_trait(?Send)]
+    impl ModelProvider for UsageProvider {
+        async fn respond(
+            &mut self,
+            _request: &ModelRequest,
+            events: &mut dyn EventSink,
+        ) -> Result<AgentAction, AgentError> {
+            events.emit(AgentEvent::Usage {
+                usage: TokenUsage {
+                    input_tokens: 8,
+                    output_tokens: 5,
+                    ..TokenUsage::default()
+                },
+            });
+            Ok(AgentAction::Tool {
+                id: "blocked".into(),
+                tool: "read_file".into(),
+                args: Value::Null,
+                reason: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn token_budget_stops_before_tool_execution() {
+        let mut events = Vec::new();
+        let mut agent = Agent::new(
+            UsageProvider,
+            MockTools,
+            Allow,
+            |event| events.push(event),
+            "system",
+            2,
+        )
+        .with_token_budget(Some(10));
+
+        assert!(matches!(
+            agent.run("task").await,
+            Err(AgentError::TokenBudget {
+                limit: 10,
+                used: 13
+            })
+        ));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ToolStart { .. }))
         );
     }
 }

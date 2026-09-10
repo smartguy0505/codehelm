@@ -48,6 +48,7 @@ pub struct Config {
     pub max_instruction_chars: usize,
     pub provider_max_retries: usize,
     pub provider_retry_base_ms: u64,
+    pub max_total_tokens: Option<u64>,
     pub permissions: crate::permissions::PermissionPolicy,
 }
 
@@ -63,6 +64,7 @@ impl Default for Config {
             max_instruction_chars: 100_000,
             provider_max_retries: 3,
             provider_retry_base_ms: 500,
+            max_total_tokens: None,
             permissions: Default::default(),
         }
     }

@@ -317,7 +317,8 @@ async fn run_agent_with_session(
         &mut events,
         system,
         config.max_turns,
-    );
+    )
+    .with_token_budget(config.max_total_tokens);
     let agent = if resumed {
         agent.with_items(initial_items)
     } else {
@@ -377,6 +378,12 @@ fn render_event(event: AgentEvent, json: bool) {
             delay_ms,
             reason,
         } => eprintln!("provider retry {attempt} in {delay_ms}ms: {reason}"),
+        AgentEvent::Usage { usage } => eprintln!(
+            "usage: {} input + {} output = {} tokens",
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.total()
+        ),
         AgentEvent::ToolStart { tool, reason, .. } => {
             if let Some(reason) = reason {
                 eprintln!("→ {tool}: {reason}");

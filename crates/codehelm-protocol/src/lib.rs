@@ -42,6 +42,22 @@ pub struct ModelRequest {
     pub tools: Vec<ToolSpec>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cached_input_tokens: u64,
+    #[serde(default)]
+    pub reasoning_tokens: u64,
+}
+
+impl TokenUsage {
+    pub fn total(self) -> u64 {
+        self.input_tokens.saturating_add(self.output_tokens)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCallRequest {
     #[serde(default)]
@@ -99,6 +115,9 @@ pub enum AgentEvent {
     },
     ModelComplete {
         turn: usize,
+    },
+    Usage {
+        usage: TokenUsage,
     },
     ToolStart {
         tool: String,

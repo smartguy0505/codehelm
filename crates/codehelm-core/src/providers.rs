@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use async_trait::async_trait;
 use codehelm_protocol::{
-    AgentAction, AgentEvent, ConversationItem, ModelRequest, Role, ToolCallRequest,
+    AgentAction, AgentEvent, ConversationItem, ModelRequest, Role, TokenUsage, ToolCallRequest,
 };
 use futures_util::StreamExt;
 use reqwest::{Client, RequestBuilder, Response, StatusCode, header::RETRY_AFTER};
@@ -108,6 +108,7 @@ impl OpenAiState {
                     reason: None,
                 });
             }
+            Some("response.completed") => emit_usage(&event["response"]["usage"], events),
             Some("error" | "response.failed") => {
                 return Err(AgentError::Provider(event.to_string()));
             }
@@ -236,6 +237,8 @@ impl ModelProvider for AnthropicProvider {
 struct AnthropicState {
     text: String,
     tools: BTreeMap<u64, AnthropicTool>,
+    input_tokens: u64,
+    cached_input_tokens: u64,
 }
 
 #[derive(Default)]
@@ -248,6 +251,23 @@ struct AnthropicTool {
 impl AnthropicState {
     fn consume(&mut self, event: Value, events: &mut dyn EventSink) -> Result<(), AgentError> {
         match event["type"].as_str() {
+            Some("message_start") => {
+                let usage = &event["message"]["usage"];
+                self.input_tokens = token_count(usage, "input_tokens")
+                    .saturating_add(token_count(usage, "cache_creation_input_tokens"))
+                    .saturating_add(token_count(usage, "cache_read_input_tokens"));
+                self.cached_input_tokens = token_count(usage, "cache_read_input_tokens");
+            }
+            Some("message_delta") => {
+                events.emit(AgentEvent::Usage {
+                    usage: TokenUsage {
+                        input_tokens: self.input_tokens,
+                        output_tokens: token_count(&event["usage"], "output_tokens"),
+                        cached_input_tokens: self.cached_input_tokens,
+                        reasoning_tokens: 0,
+                    },
+                });
+            }
             Some("content_block_start") if event["content_block"]["type"] == "tool_use" => {
                 let index = event["index"].as_u64().unwrap_or(self.tools.len() as u64);
                 self.tools.insert(
@@ -430,6 +450,15 @@ impl OllamaState {
         if let Some(error) = chunk["error"].as_str() {
             return Err(AgentError::Provider(error.into()));
         }
+        if chunk["done"].as_bool() == Some(true) {
+            events.emit(AgentEvent::Usage {
+                usage: TokenUsage {
+                    input_tokens: token_count(&chunk, "prompt_eval_count"),
+                    output_tokens: token_count(&chunk, "eval_count"),
+                    ..TokenUsage::default()
+                },
+            });
+        }
         if let Some(delta) = chunk["message"]["content"]
             .as_str()
             .filter(|text| !text.is_empty())
@@ -531,6 +560,21 @@ fn tool_action(mut calls: Vec<ToolCallRequest>) -> AgentAction {
     } else {
         AgentAction::Tools { calls }
     }
+}
+
+fn token_count(value: &Value, field: &str) -> u64 {
+    value[field].as_u64().unwrap_or(0)
+}
+
+fn emit_usage(value: &Value, events: &mut dyn EventSink) {
+    events.emit(AgentEvent::Usage {
+        usage: TokenUsage {
+            input_tokens: token_count(value, "input_tokens"),
+            output_tokens: token_count(value, "output_tokens"),
+            cached_input_tokens: token_count(&value["input_tokens_details"], "cached_tokens"),
+            reasoning_tokens: token_count(&value["output_tokens_details"], "reasoning_tokens"),
+        },
+    });
 }
 
 fn role_name(role: Role) -> &'static str {
@@ -722,6 +766,74 @@ mod tests {
         assert!(
             matches!(state.finish().unwrap(), AgentAction::Tool { id, tool, .. } if id == "call_1" && tool == "read_file")
         );
+    }
+
+    #[test]
+    fn provider_usage_is_normalized() {
+        let mut openai = OpenAiState::default();
+        let mut openai_events = Vec::new();
+        openai
+            .consume(
+                json!({"type":"response.completed","response":{"usage":{
+                    "input_tokens":20,"output_tokens":7,
+                    "input_tokens_details":{"cached_tokens":5},
+                    "output_tokens_details":{"reasoning_tokens":3}
+                }}}),
+                &mut |event| openai_events.push(event),
+            )
+            .unwrap();
+        assert!(matches!(
+            openai_events.as_slice(),
+            [AgentEvent::Usage { usage }]
+                if *usage == TokenUsage {
+                    input_tokens: 20,
+                    output_tokens: 7,
+                    cached_input_tokens: 5,
+                    reasoning_tokens: 3,
+                }
+        ));
+
+        let mut anthropic = AnthropicState::default();
+        let mut anthropic_events = Vec::new();
+        anthropic
+            .consume(
+                json!({"type":"message_start","message":{"usage":{
+                    "input_tokens":10,"cache_creation_input_tokens":4,
+                    "cache_read_input_tokens":6
+                }}}),
+                &mut |event| anthropic_events.push(event),
+            )
+            .unwrap();
+        anthropic
+            .consume(
+                json!({"type":"message_delta","usage":{"output_tokens":8}}),
+                &mut |event| anthropic_events.push(event),
+            )
+            .unwrap();
+        assert!(matches!(
+            anthropic_events.as_slice(),
+            [AgentEvent::Usage { usage }]
+                if *usage == TokenUsage {
+                    input_tokens: 20,
+                    output_tokens: 8,
+                    cached_input_tokens: 6,
+                    reasoning_tokens: 0,
+                }
+        ));
+
+        let mut ollama = OllamaState::default();
+        let mut ollama_events = Vec::new();
+        ollama
+            .consume(
+                json!({"message":{"content":"ok"},"done":true,
+                    "prompt_eval_count":12,"eval_count":3}),
+                &mut |event| ollama_events.push(event),
+            )
+            .unwrap();
+        assert!(ollama_events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Usage { usage } if usage.input_tokens == 12 && usage.output_tokens == 3
+        )));
     }
 
     #[test]
